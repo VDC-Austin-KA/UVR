@@ -135,9 +135,9 @@ class JobManager:
         except pipeline.PipelineError as exc:
             job.error = str(exc)
             self._set_stage(job, "error", 0.0)
-        except Exception:  # noqa: BLE001 - surface unexpected errors to the UI too
+        except Exception as exc:  # noqa: BLE001 - surface unexpected errors to the UI too
             logger.exception("job %s crashed", job.id)
-            job.error = "Something went wrong while processing that file."
+            job.error = f"{type(exc).__name__}: {exc}"[:500]
             self._set_stage(job, "error", 0.0)
         finally:
             if upload_path.exists():

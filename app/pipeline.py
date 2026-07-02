@@ -122,7 +122,6 @@ def separate_vocals(wav_path: Path, out_dir: Path, progress_cb: ProgressCB = Non
         model_file_dir=str(config.MODEL_DIR),
         output_single_stem="Vocals",
         normalization_threshold=0.9,
-        sample_rate=DENOISE_SR,
         log_level=logging.WARNING,
     )
     separator.load_model(model_filename=config.SEPARATION_MODEL)
