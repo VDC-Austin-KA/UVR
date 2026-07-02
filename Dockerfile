@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libsndfile1 \
       ca-certificates \
       build-essential \
+      libopenblas-dev \
+      libgfortran5 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv
