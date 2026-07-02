@@ -1,11 +1,15 @@
 FROM python:3.11-slim
 
 # ffmpeg/ffprobe for extraction + mastering; libsndfile for audio I/O;
-# ca-certificates so the DeepFilterNet binary fetch below can verify TLS.
+# ca-certificates so the DeepFilterNet binary fetch below can verify TLS;
+# build-essential because audio-separator's `diffq` dependency compiles a
+# C extension (bitpack.c) at install time and python:3.11-slim ships no
+# compiler by default.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg \
       libsndfile1 \
       ca-certificates \
+      build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv
