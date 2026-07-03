@@ -29,14 +29,10 @@ ADD https://github.com/Rikorose/DeepFilterNet/releases/download/v${DEEPFILTER_VE
     /usr/local/bin/deep-filter
 RUN chmod +x /usr/local/bin/deep-filter
 
-# Install CPU-only torch AND torchvision from the same index so they are an
-# ABI-matched pair. torchvision is required by onnx2torch, which audio-separator
-# imports when loading MDX models; if torchvision instead comes from the default
-# PyPI index (built against a different torch) its C ops fail to register and
-# model loading dies with "operator torchvision::nms does not exist". Installing
-# from the CPU wheel index also avoids pulling several GB of unused CUDA
-# packages. torch drags in numpy 2.x here; requirements.txt pins it back to a
-# numpy<2 / onnxruntime pair that audio-separator supports.
+# Install a CPU-only torch build first so the subsequent audio-separator
+# install (which pins torch>=2.3 but not a variant) doesn't pull several GB of
+# unused CUDA runtime packages. torch drags in numpy 2.x here; requirements.txt
+# pins it back to a numpy<2 / onnxruntime pair that audio-separator supports.
 RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
