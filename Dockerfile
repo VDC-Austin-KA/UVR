@@ -1,67 +1,59 @@
 FROM python:3.11-slim
 
-# ffmpeg/ffprobe for extraction + mastering; libsndfile for audio I/O;
-# ca-certificates so the DeepFilterNet binary fetch below can verify TLS;
-# build-essential because audio-separator's `diffq` dependency compiles a
-# C extension (bitpack.c) at install time and python:3.11-slim ships no
-# compiler by default.
+# ffmpeg for all audio I/O + amplification; curl/ca-certificates to fetch the
+# DeepFilterNet binary; git/cmake/build-essential to build whisper.cpp.
+# NOTE: there is deliberately NO python ML stack (torch/onnxruntime/numpy) --
+# that was the sole cause of the "import numpy failed" runtime crashes. Both AI
+# engines here are self-contained native binaries with zero python deps.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg \
-      libsndfile1 \
       ca-certificates \
+      curl \
+      git \
+      cmake \
       build-essential \
-      libopenblas-dev \
-      libgfortran5 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv
 
-# OMP/OPENBLAS/MKL/NUMEXPR thread caps: numpy's bundled OpenBLAS sizes its
-# per-thread work buffers to the host CPU count; on a many-core host with a
-# memory-capped container (as on Railway) that allocation can fail at import
-# time, which onnxruntime then reports as the opaque "import numpy failed".
-# This service does its heavy lifting in ffmpeg and onnxruntime (which manages
-# its own threads), so single-threaded BLAS is a safe, negligible-cost default.
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    UVR_MODEL_DIR=/srv/models \
     UVR_WORK_DIR=/tmp/uvr-jobs \
     UVR_DEEPFILTER_BIN=/usr/local/bin/deep-filter \
-    OMP_NUM_THREADS=1 \
-    OPENBLAS_NUM_THREADS=1 \
-    MKL_NUM_THREADS=1 \
-    NUMEXPR_NUM_THREADS=1
+    UVR_WHISPER_BIN=/usr/local/bin/whisper-cli \
+    UVR_WHISPER_MODEL=/srv/models/ggml-base.en.bin
 
-# DeepFilterNet's standalone Rust CLI: statically built, model weights
-# embedded, no torch/torchaudio version dance required for denoising.
+# DeepFilterNet3 speech-enhancement CLI: statically built Rust binary with the
+# model embedded (no python/torch/numpy). This is the primary noise-removal
+# engine -- it pulls faint speech out of non-stationary noise (traffic, crowd)
+# far better than ffmpeg's generic denoisers.
 ARG DEEPFILTER_VERSION=0.5.6
 ADD https://github.com/Rikorose/DeepFilterNet/releases/download/v${DEEPFILTER_VERSION}/deep-filter-${DEEPFILTER_VERSION}-x86_64-unknown-linux-musl \
     /usr/local/bin/deep-filter
 RUN chmod +x /usr/local/bin/deep-filter
 
-# Install a CPU-only torch build first so the subsequent audio-separator
-# install (which pins torch>=2.3 but not a variant) doesn't pull several GB of
-# unused CUDA runtime packages. torch drags in numpy 2.x here; requirements.txt
-# pins it back to a numpy<2 / onnxruntime pair that audio-separator supports.
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# whisper.cpp for transcription/captions (self-contained C++ binary, no numpy).
+# Best-effort: the whole step is wrapped so a build/download hiccup can never
+# fail the image -- transcription just gets skipped at runtime if absent.
+ARG WHISPER_MODEL=base.en
+RUN bash -c 'set -eux; \
+      git clone --depth 1 https://github.com/ggml-org/whisper.cpp /tmp/whisper.cpp; \
+      cmake -S /tmp/whisper.cpp -B /tmp/whisper.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON; \
+      cmake --build /tmp/whisper.cpp/build -j --config Release --target whisper-cli; \
+      cp /tmp/whisper.cpp/build/bin/whisper-cli /usr/local/bin/whisper-cli; \
+      mkdir -p /srv/models; \
+      curl -fSL -o /srv/models/ggml-'"${WHISPER_MODEL}"'.bin \
+        https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-'"${WHISPER_MODEL}"'.bin; \
+      rm -rf /tmp/whisper.cpp; \
+      /usr/local/bin/whisper-cli --help >/dev/null 2>&1 && echo "whisper OK"; \
+    ' || echo "WHISPER SETUP FAILED — transcription disabled (audio pipeline unaffected)"
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Exercise the full model-loading import chain at build time so a broken build
-# fails here instead of at runtime on the first job. This covers both failure
-# modes seen in practice: onnxruntime's numpy C-API import ("import numpy
-# failed") and onnx2torch's torchvision op registration ("operator
-# torchvision::nms does not exist").
-RUN python -c "import numpy, onnxruntime, torchvision, onnx2torch; from audio_separator.separator.architectures.mdx_separator import MDXSeparator; print('deps OK -> numpy', numpy.__version__, '/ onnxruntime', onnxruntime.__version__, '/ torchvision', torchvision.__version__)"
-
 COPY app ./app
 COPY static ./static
-COPY scripts ./scripts
-
-# Bake the default UVR separation model into the image so the first
-# upload doesn't pay for a cold model download.
-RUN python scripts/prefetch_models.py
 
 EXPOSE 8000
 

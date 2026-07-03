@@ -1,17 +1,3 @@
-# Pin numpy and onnxruntime to a verified-compatible pair.
-#
-# audio-separator requires numpy<2, but the earlier `pip install torch` layer
-# pulls numpy 2.x in first. Without explicit pins the resolver can leave
-# onnxruntime and numpy at an ABI-mismatched pair (or a stale build layer can
-# preserve one). When that happens onnxruntime's compiled C-extension fails its
-# internal numpy import and raises the opaque "ImportError: import numpy failed"
-# the moment a job starts the vocal-separation stage. Pinning both to a pair
-# validated on python:3.11-slim makes the build reproducible and keeps that
-# import working.
-numpy==1.26.4
-onnxruntime==1.27.0
-
 fastapi==0.139.0
 uvicorn[standard]==0.49.0
 python-multipart==0.0.20
-audio-separator[cpu]==0.30.2

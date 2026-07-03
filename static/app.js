@@ -19,6 +19,10 @@
   const originalAudio = document.getElementById("original-audio");
   const downloadWav = document.getElementById("download-wav");
   const downloadMp3 = document.getElementById("download-mp3");
+  const downloadTxt = document.getElementById("download-txt");
+  const downloadSrt = document.getElementById("download-srt");
+  const transcriptBlock = document.getElementById("transcript-block");
+  const transcriptText = document.getElementById("transcript-text");
 
   let chosenFile = null;
   let pollTimer = null;
@@ -166,6 +170,30 @@
     originalAudio.src = originalUrl;
     downloadWav.href = wavUrl;
     downloadMp3.href = mp3Url;
+
+    const downloads = job.downloads || [];
+    const hasTxt = downloads.includes("transcript.txt");
+    const hasSrt = downloads.includes("captions.srt");
+
+    if (job.transcript) {
+      transcriptText.textContent = job.transcript;
+      transcriptBlock.hidden = false;
+    } else {
+      transcriptBlock.hidden = true;
+    }
+
+    if (hasTxt) {
+      downloadTxt.href = `/api/jobs/${jobId}/download/transcript.txt`;
+      downloadTxt.hidden = false;
+    } else {
+      downloadTxt.hidden = true;
+    }
+    if (hasSrt) {
+      downloadSrt.href = `/api/jobs/${jobId}/download/captions.srt`;
+      downloadSrt.hidden = false;
+    } else {
+      downloadSrt.hidden = true;
+    }
 
     showOnly(resultCard);
   }
