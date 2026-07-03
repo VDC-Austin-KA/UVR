@@ -38,12 +38,12 @@ RUN pip install --no-cache-dir torch torchvision --index-url https://download.py
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Fail the build loudly if the numpy <-> onnxruntime ABI pairing ends up wrong
-# (e.g. a stale cached layer, or resolver drift onto an onnxruntime built for a
-# different numpy). Otherwise onnxruntime's C-extension only fails at runtime,
-# the first time a job hits the separation stage, with the opaque
-# "ImportError: import numpy failed" -- far better to catch it here.
-RUN python -c "import numpy, onnxruntime; from audio_separator.separator import Separator; print('deps OK -> numpy', numpy.__version__, '/ onnxruntime', onnxruntime.__version__)"
+# Exercise the full model-loading import chain at build time so a broken build
+# fails here instead of at runtime on the first job. This covers both failure
+# modes seen in practice: onnxruntime's numpy C-API import ("import numpy
+# failed") and onnx2torch's torchvision op registration ("operator
+# torchvision::nms does not exist").
+RUN python -c "import numpy, onnxruntime, torchvision, onnx2torch; from audio_separator.separator.architectures.mdx_separator import MDXSeparator; print('deps OK -> numpy', numpy.__version__, '/ onnxruntime', onnxruntime.__version__, '/ torchvision', torchvision.__version__)"
 
 COPY app ./app
 COPY static ./static
