@@ -83,7 +83,12 @@ def download(job_id: str, name: str) -> FileResponse:
     path = job.result_files.get(name)
     if path is None or not path.exists():
         raise HTTPException(404, "That file isn't available.")
-    media_type = "audio/wav" if path.suffix == ".wav" else "audio/mpeg"
+    media_type = {
+        ".wav": "audio/wav",
+        ".mp3": "audio/mpeg",
+        ".txt": "text/plain",
+        ".srt": "application/x-subrip",
+    }.get(path.suffix, "application/octet-stream")
     download_name = f"{Path(job.original_filename).stem}-{name}"
     return FileResponse(path, media_type=media_type, filename=download_name)
 

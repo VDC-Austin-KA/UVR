@@ -5,36 +5,42 @@ environment (traffic, wind, crowd, room noise). This service:
 
 1. **Extracts the audio** at high fidelity (48kHz / 24-bit PCM), straight from
    the source via `ffmpeg`.
-2. **Reduces the background noise** — bandpasses the signal to the voice range
-   and runs `ffmpeg`'s adaptive FFT denoiser (`afftdn`, two passes) plus a
-   non-local-means pass (`anlmdn`) to subtract steady traffic/wind/hiss/hum.
+2. **Removes the background noise with DeepFilterNet3** — a deep-learning
+   speech enhancer (self-contained Rust binary, model embedded, no
+   python/torch/numpy) that predicts a suppression filter per frequency bin.
+   It handles non-stationary noise (traffic, crowd, wind) far better than
+   generic denoisers, and removing the noise *first* is what lets the next step
+   boost the voice without boosting the noise. Falls back to `ffmpeg` denoisers
+   if the binary is unavailable.
 3. **Amplifies the quiet speech** so barely-audible voices become clearly
-   hearable — `speechnorm` lifts quiet syllables, `dynaudnorm` evens out the
-   level over time, `loudnorm` normalizes to a consistent loudness, and a
-   limiter keeps the boosted result from clipping.
-4. Hands you back a **lossless WAV** and a **compressed MP3**, plus the
-   original extracted audio for comparison.
+   hearable — `speechnorm` lifts quiet syllables, an `acompressor` +
+   `dynaudnorm` even out the dynamics, `loudnorm` normalizes to a loud,
+   consistent level, and a limiter keeps it from clipping.
+4. **Transcribes the speech with Whisper** (`whisper.cpp` — a self-contained
+   C++ binary, no numpy) into a readable transcript plus `.srt` captions.
+   Whisper is remarkably good at reading speech that is barely audible to the
+   ear. Best-effort: if unavailable, the cleaned audio still returns.
+5. Hands you back a **lossless WAV** and a **compressed MP3**, the transcript
+   and captions, plus the original extracted audio for comparison.
 
 It's a plain, mobile-friendly web page — no app-store install needed. Open the
 Railway URL on your iPhone in Safari and use it like any other site; tap
 **Share → Add to Home Screen** if you want it to behave like an app icon.
 
-## Why pure ffmpeg (no ML stack)
+## Why native binaries, not the Python ML stack
 
 An earlier version used a Python machine-learning stack (torch + onnxruntime +
-`audio-separator`/UVR) for model-based vocal separation. That stack repeatedly
-failed **at runtime** on the host with an opaque `ImportError: import numpy
-failed` coming out of onnxruntime — a failure that only reproduced inside the
-deployment environment, not in local or build-time runs, which made it
-effectively undebuggable.
+`audio-separator`/UVR). It repeatedly failed **at runtime** with an opaque
+`ImportError: import numpy failed` from onnxruntime — a failure that only
+reproduced inside the deployment environment, never in local or build-time
+runs, which made it effectively undebuggable.
 
-This version does all of the work with `ffmpeg`, which is already installed and
-has capable built-in denoisers and dynamics processors. The result: **no numpy,
-no torch, no onnxruntime, no model downloads** — a small image that builds in
-under a minute and can't hit that class of failure. It won't separate music
-from vocals the way a dedicated source-separation model would, but for the
-target use case — lifting faint speech out of ambient/broadband noise — it is
-reliable and effective.
+This version keeps the AI quality but drops that fragility: the two models —
+**DeepFilterNet3** (enhancement) and **Whisper** (transcription) — run as
+self-contained native binaries with **no python, torch, onnxruntime, or numpy**.
+There is nothing in the image that can throw `import numpy failed`. ffmpeg
+handles extraction and amplification; DeepFilterNet does the heavy noise
+removal; whisper.cpp does the captions.
 
 ## Architecture
 
@@ -88,12 +94,6 @@ python scripts/smoke_test.py /path/to/clip.mp4   # or your own file
 | `UVR_MAX_DURATION_SECONDS` | `3600` | Reject sources longer than this. |
 | `UVR_MAX_CONCURRENT_JOBS` | `2` | Thread pool size for processing. |
 | `UVR_JOB_TTL_SECONDS` | `3600` | How long finished job files stick around before cleanup. |
-
-## Roadmap
-
-- **Transcription / captions.** Automatic speech-to-text of the cleaned audio,
-  planned via a self-contained (no-numpy) engine such as `whisper.cpp`, kept
-  best-effort so it can never break the core audio pipeline.
 
 ## Limitations
 

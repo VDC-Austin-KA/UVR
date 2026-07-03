@@ -39,8 +39,9 @@
       </div>
       <ol id="stage-list" class="stage-list">
         <li data-stage="extracting audio">Extracting audio</li>
-        <li data-stage="removing background noise">Removing background noise</li>
+        <li data-stage="removing background noise">Removing background noise (DeepFilterNet)</li>
         <li data-stage="amplifying quiet speech">Amplifying quiet speech</li>
+        <li data-stage="transcribing speech">Transcribing speech (Whisper)</li>
       </ol>
       <p id="progress-note" class="muted">
         Longer clips can take a few minutes on shared CPU &mdash; feel free to
@@ -64,9 +65,15 @@
         <div class="player-label">Original extracted audio</div>
         <audio id="original-audio" controls preload="none"></audio>
       </div>
+      <div id="transcript-block" class="transcript-block" hidden>
+        <div class="player-label">Transcript</div>
+        <pre id="transcript-text" class="transcript-text"></pre>
+      </div>
       <div class="download-row">
         <a id="download-wav" class="btn btn--primary" download>Download WAV (lossless)</a>
         <a id="download-mp3" class="btn" download>Download MP3</a>
+        <a id="download-txt" class="btn" download hidden>Download transcript (.txt)</a>
+        <a id="download-srt" class="btn" download hidden>Download captions (.srt)</a>
       </div>
       <button id="new-btn" class="btn btn--ghost">Process another file</button>
     </section>

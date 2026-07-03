@@ -28,6 +28,7 @@ STAGES = [
     "extracting audio",
     "removing background noise",
     "amplifying quiet speech",
+    "transcribing speech",
     "done",
     "error",
 ]
@@ -43,6 +44,7 @@ class Job:
     error: Optional[str] = None
     work_dir: Optional[Path] = None
     result_files: dict[str, Path] = field(default_factory=dict)
+    transcript: Optional[str] = None
 
     def to_public_dict(self) -> dict:
         return {
@@ -52,6 +54,7 @@ class Job:
             "progress": round(self.stage_progress, 3),
             "error": self.error,
             "downloads": sorted(self.result_files.keys()) if self.status == "done" else [],
+            "transcript": self.transcript if self.status == "done" else None,
         }
 
 
@@ -101,9 +104,9 @@ class JobManager:
             job.result_files["original.wav"] = original_wav
 
             self._set_stage(job, "removing background noise", 0.0)
-            denoised_path = pipeline.reduce_noise(
+            enhanced_path = pipeline.enhance_speech(
                 original_wav,
-                work_dir / "denoised.wav",
+                work_dir,
                 progress_cb=lambda _stage, pct: self._set_stage(
                     job, "removing background noise", pct
                 ),
@@ -113,7 +116,7 @@ class JobManager:
             final_wav = work_dir / "voice_clean.wav"
             final_mp3 = work_dir / "voice_clean.mp3"
             pipeline.amplify_voice(
-                denoised_path,
+                enhanced_path,
                 final_wav,
                 final_mp3,
                 progress_cb=lambda _stage, pct: self._set_stage(
@@ -122,6 +125,21 @@ class JobManager:
             )
             job.result_files["voice_clean.wav"] = final_wav
             job.result_files["voice_clean.mp3"] = final_mp3
+
+            self._set_stage(job, "transcribing speech", 0.0)
+            result = pipeline.transcribe(
+                final_wav,
+                work_dir,
+                progress_cb=lambda _stage, pct: self._set_stage(
+                    job, "transcribing speech", pct
+                ),
+            )
+            if result:
+                job.transcript = result["text"]
+                if result["txt"].exists():
+                    job.result_files["transcript.txt"] = result["txt"]
+                if result["srt"].exists():
+                    job.result_files["captions.srt"] = result["srt"]
 
             self._set_stage(job, "done", 1.0)
         except pipeline.PipelineError as exc:
