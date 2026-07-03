@@ -29,13 +29,21 @@ ADD https://github.com/Rikorose/DeepFilterNet/releases/download/v${DEEPFILTER_VE
     /usr/local/bin/deep-filter
 RUN chmod +x /usr/local/bin/deep-filter
 
-# Install a CPU-only torch/torchvision build first so the subsequent
-# audio-separator install (which pins torch>=2.3 but not a variant)
-# doesn't pull several GB of unused CUDA runtime packages.
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# Install a CPU-only torch build first so the subsequent audio-separator
+# install (which pins torch>=2.3 but not a variant) doesn't pull several GB of
+# unused CUDA runtime packages. torch drags in numpy 2.x here; requirements.txt
+# pins it back to a numpy<2 / onnxruntime pair that audio-separator supports.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Fail the build loudly if the numpy <-> onnxruntime ABI pairing ends up wrong
+# (e.g. a stale cached layer, or resolver drift onto an onnxruntime built for a
+# different numpy). Otherwise onnxruntime's C-extension only fails at runtime,
+# the first time a job hits the separation stage, with the opaque
+# "ImportError: import numpy failed" -- far better to catch it here.
+RUN python -c "import numpy, onnxruntime; from audio_separator.separator import Separator; print('deps OK -> numpy', numpy.__version__, '/ onnxruntime', onnxruntime.__version__)"
 
 COPY app ./app
 COPY static ./static
