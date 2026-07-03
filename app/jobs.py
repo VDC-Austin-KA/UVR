@@ -26,9 +26,8 @@ logger = logging.getLogger("uvr.jobs")
 STAGES = [
     "queued",
     "extracting audio",
-    "isolating voices",
     "removing background noise",
-    "boosting quiet speech",
+    "amplifying quiet speech",
     "done",
     "error",
 ]
@@ -101,31 +100,24 @@ class JobManager:
             pipeline.extract_audio(upload_path, original_wav)
             job.result_files["original.wav"] = original_wav
 
-            self._set_stage(job, "isolating voices", 0.0)
-            vocals_path = pipeline.separate_vocals(
-                original_wav,
-                work_dir / "separated",
-                progress_cb=lambda _stage, pct: self._set_stage(job, "isolating voices", pct),
-            )
-
             self._set_stage(job, "removing background noise", 0.0)
-            denoised_path = pipeline.denoise_speech(
-                vocals_path,
-                work_dir,
+            denoised_path = pipeline.reduce_noise(
+                original_wav,
+                work_dir / "denoised.wav",
                 progress_cb=lambda _stage, pct: self._set_stage(
                     job, "removing background noise", pct
                 ),
             )
 
-            self._set_stage(job, "boosting quiet speech", 0.0)
+            self._set_stage(job, "amplifying quiet speech", 0.0)
             final_wav = work_dir / "voice_clean.wav"
             final_mp3 = work_dir / "voice_clean.mp3"
-            pipeline.master_speech(
+            pipeline.amplify_voice(
                 denoised_path,
                 final_wav,
                 final_mp3,
                 progress_cb=lambda _stage, pct: self._set_stage(
-                    job, "boosting quiet speech", pct
+                    job, "amplifying quiet speech", pct
                 ),
             )
             job.result_files["voice_clean.wav"] = final_wav

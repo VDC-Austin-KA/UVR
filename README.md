@@ -1,26 +1,40 @@
 # Voice Isolation Studio
 
-Upload a video (or audio file). This service:
+Upload a video or audio file with faint, hard-to-hear voices in a noisy
+environment (traffic, wind, crowd, room noise). This service:
 
-1. **Extracts the audio at the highest practical quality** — lossless 48kHz/24-bit PCM, straight from the source via `ffmpeg`.
-2. **Isolates the voices** from music, ambience, and background noise (traffic, wind, room tone, etc.) using a UVR (Ultimate Vocal Remover) MDX-Net model, via the [`audio-separator`](https://github.com/nomadkaraoke/python-audio-separator) library — a Python wrapper around the same models developed in the [UVR project](https://github.com/Anjok07/ultimatevocalremovergui) (`Anjok07`), which this app's repo tracks and deploys.
-3. **Denoises the isolated speech** with [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet)'s standalone Rust CLI binary — a deep-learning speech enhancement model (weights embedded in the binary, no Python/torch dependency) that strips residual broadband/environmental noise while preserving the voice.
-4. **Boosts quiet, barely-audible speech** with an `ffmpeg` mastering chain (`highpass` → `afftdn` → `speechnorm` → `loudnorm`) so faint dialogue becomes intelligible without clipping louder parts, then normalizes to a consistent, comfortable loudness (EBU R128, -16 LUFS).
-5. Hands you back a **lossless WAV master** and a **compressed MP3** for quick mobile playback/download, plus the original extracted audio for comparison.
+1. **Extracts the audio** at high fidelity (48kHz / 24-bit PCM), straight from
+   the source via `ffmpeg`.
+2. **Reduces the background noise** — bandpasses the signal to the voice range
+   and runs `ffmpeg`'s adaptive FFT denoiser (`afftdn`, two passes) plus a
+   non-local-means pass (`anlmdn`) to subtract steady traffic/wind/hiss/hum.
+3. **Amplifies the quiet speech** so barely-audible voices become clearly
+   hearable — `speechnorm` lifts quiet syllables, `dynaudnorm` evens out the
+   level over time, `loudnorm` normalizes to a consistent loudness, and a
+   limiter keeps the boosted result from clipping.
+4. Hands you back a **lossless WAV** and a **compressed MP3**, plus the
+   original extracted audio for comparison.
 
 It's a plain, mobile-friendly web page — no app-store install needed. Open the
 Railway URL on your iPhone in Safari and use it like any other site; tap
 **Share → Add to Home Screen** if you want it to behave like an app icon.
 
-## Why these particular tools
+## Why pure ffmpeg (no ML stack)
 
-`lalal.ai` (the reference point named in the original request) is a paid,
-closed-source SaaS API — there's no model to self-host from it. This app
-instead builds the same *kind* of pipeline (extract → isolate voice →
-denoise → normalize) entirely on open-source components so it can be
-self-hosted on Railway with no third-party API keys or per-minute billing:
-UVR's separation models for the isolation step, and DeepFilterNet for the
-denoise step.
+An earlier version used a Python machine-learning stack (torch + onnxruntime +
+`audio-separator`/UVR) for model-based vocal separation. That stack repeatedly
+failed **at runtime** on the host with an opaque `ImportError: import numpy
+failed` coming out of onnxruntime — a failure that only reproduced inside the
+deployment environment, not in local or build-time runs, which made it
+effectively undebuggable.
+
+This version does all of the work with `ffmpeg`, which is already installed and
+has capable built-in denoisers and dynamics processors. The result: **no numpy,
+no torch, no onnxruntime, no model downloads** — a small image that builds in
+under a minute and can't hit that class of failure. It won't separate music
+from vocals the way a dedicated source-separation model would, but for the
+target use case — lifting faint speech out of ambient/broadband noise — it is
+reliable and effective.
 
 ## Architecture
 
@@ -28,79 +42,65 @@ denoise step.
 static/            mobile-first upload UI (vanilla HTML/CSS/JS)
 app/main.py         FastAPI routes: upload, job status polling, downloads
 app/jobs.py          in-memory job manager + background thread pool
-app/pipeline.py       ffmpeg extraction, UVR separation, DeepFilterNet denoise, mastering
-scripts/prefetch_models.py   downloads the UVR model at Docker build time
+app/pipeline.py       ffmpeg extraction, denoise, and voice amplification
 Dockerfile / railway.toml     container + Railway deploy config
 ```
 
-Jobs run on a small thread pool (`UVR_MAX_CONCURRENT_JOBS`, default 1 — CPU
-inference is the bottleneck) and report progress that the frontend polls.
-State is in-memory and per-instance, which is intentional: this is a
-single-service MVP with no database. If you outgrow one instance, swap the
-`JobManager` for a queue (e.g. Redis + RQ) and move job files to object
-storage — the `pipeline.py` functions are already decoupled from the web
-layer so that's a contained change.
+Jobs run on a small thread pool (`UVR_MAX_CONCURRENT_JOBS`) and report progress
+the frontend polls for. State is in-memory and per-instance — this is a
+single-service MVP with no database; the `pipeline.py` functions are decoupled
+from the web layer, so moving to a queue + object storage later is contained.
 
 ## Running locally
 
-Requires `ffmpeg` on PATH (`apt install ffmpeg` / `brew install ffmpeg`), and
-the [DeepFilterNet CLI binary](https://github.com/Rikorose/DeepFilterNet/releases)
-(`deep-filter-<version>-<platform>`) downloaded and on PATH as `deep-filter`
-(or point `UVR_DEEPFILTER_BIN` at wherever you put it).
+Requires `ffmpeg` on PATH (`apt install ffmpeg` / `brew install ffmpeg`).
 
 ```bash
-# Install a CPU-only torch build first (skip this if you have a GPU and
-# want audio-separator to use it — just `pip install torch torchvision` normally).
 python3 -m venv .venv && source .venv/bin/activate
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
-python scripts/prefetch_models.py   # optional: warm the UVR model cache up front
 uvicorn app.main:app --reload
 ```
 
 Then open http://localhost:8000.
 
-`scripts/smoke_test.py` exercises the whole web app (upload → job
-progress → downloads) end to end with the two model-dependent stages
-stubbed out; useful for verifying the FastAPI/job-manager layer without
-needing the UVR/DeepFilterNet weights on hand:
+`scripts/smoke_test.py` runs the whole app end to end — it synthesizes a noisy
+"faint speech" clip, uploads it, waits for the job, and downloads the results
+(nothing is stubbed, because the pipeline has no external models):
 
 ```bash
-python scripts/smoke_test.py /path/to/any/test/video.mp4
+python scripts/smoke_test.py                     # synthetic noisy test clip
+python scripts/smoke_test.py /path/to/clip.mp4   # or your own file
 ```
 
 ## Deploying to Railway
 
-1. Push this repo to GitHub (already done if you're reading this from the
-   repo) and create a new Railway project from it.
+1. Push this repo to GitHub and create a Railway project from it.
 2. Railway auto-detects `railway.toml` and builds via the `Dockerfile` — no
-   extra configuration needed. The model is baked into the image at build
-   time (see `scripts/prefetch_models.py`), so cold starts don't pay for a
-   model download.
+   extra configuration needed.
 3. Railway sets `$PORT` automatically; the container listens on it.
-4. Once deployed, open the generated `*.up.railway.app` URL — on desktop or
-   on your iPhone in Safari.
+4. Open the generated `*.up.railway.app` URL — on desktop or on your iPhone.
 
 ### Optional environment variables
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `UVR_SEPARATION_MODEL` | `Kim_Vocal_2.onnx` | Which UVR MDX-Net model to use for voice isolation. See `audio-separator --list_models` for alternatives. |
 | `UVR_MAX_UPLOAD_MB` | `500` | Reject uploads larger than this. |
-| `UVR_MAX_DURATION_SECONDS` | `1800` | Reject sources longer than this (keeps CPU jobs bounded). |
-| `UVR_MAX_CONCURRENT_JOBS` | `1` | Thread pool size for processing. Raise only if your Railway plan has the CPU/RAM to match. |
+| `UVR_MAX_DURATION_SECONDS` | `3600` | Reject sources longer than this. |
+| `UVR_MAX_CONCURRENT_JOBS` | `2` | Thread pool size for processing. |
 | `UVR_JOB_TTL_SECONDS` | `3600` | How long finished job files stick around before cleanup. |
+
+## Roadmap
+
+- **Transcription / captions.** Automatic speech-to-text of the cleaned audio,
+  planned via a self-contained (no-numpy) engine such as `whisper.cpp`, kept
+  best-effort so it can never break the core audio pipeline.
 
 ## Limitations
 
-- **CPU-only inference.** Railway services don't come with a GPU, so
-  processing time scales with clip length — expect roughly real-time-ish
-  throughput for the default model on a few vCPUs. There's a duration cap
-  (`UVR_MAX_DURATION_SECONDS`) to keep jobs from running away.
-- **Single instance, in-memory job state.** Don't scale this service
-  horizontally without also moving job state out of process (see
-  Architecture above) — a second instance won't see jobs created on the
-  first.
-- **Voice isolation, not diarization.** The pipeline isolates "voice" as a
-  class of sound (vs. music/ambience/noise); it doesn't separate multiple
-  overlapping speakers from each other.
+- **CPU-only processing.** ffmpeg is fast, but very long clips still take time;
+  there's a duration cap (`UVR_MAX_DURATION_SECONDS`) to keep jobs bounded.
+- **Single instance, in-memory job state.** Don't scale horizontally without
+  moving job state out of process.
+- **Noise reduction, not source separation.** This lifts speech out of
+  ambient/broadband noise; it does not separate overlapping speakers or strip
+  musical accompaniment the way a dedicated separation model would.

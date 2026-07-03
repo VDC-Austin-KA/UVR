@@ -1,14 +1,16 @@
 """Audio processing pipeline.
 
-Video in -> lossless audio extraction -> UVR-based vocal isolation
-(separates speech from music/ambience/traffic) -> DeepFilterNet speech
-denoising (kills residual broadband/traffic noise) -> ffmpeg mastering
-chain that boosts quiet passages so faint speech becomes intelligible
-without clipping the loud parts.
+Video/audio in -> lossless audio extraction -> a speech-focused ffmpeg
+cleanup chain that (1) knocks down steady background noise (traffic,
+wind, hiss, hum), (2) restricts the signal to the voice band, and
+(3) heavily amplifies quiet speech so barely-audible voices become
+clearly hearable, then normalizes to a consistent, comfortable level.
 
-Every stage is a plain function that shells out to ffmpeg or calls a
-local model; nothing here talks to the job manager directly so it can
-be unit-tested or reused from a CLI.
+Everything here shells out to ffmpeg -- there is deliberately NO Python
+machine-learning stack (no torch / onnxruntime / numpy). That stack was
+the source of persistent "import numpy failed" runtime crashes on the
+host, and ffmpeg's built-in denoisers + dynamics do the job with zero
+heavyweight dependencies, so the service is small, fast, and reliable.
 """
 
 from __future__ import annotations
@@ -20,14 +22,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from app import config
-
 logger = logging.getLogger("uvr.pipeline")
 
 ProgressCB = Optional[Callable[[str, float], None]]
 
-# Sample rate DeepFilterNet's bundled checkpoints expect.
-DENOISE_SR = 48000
+# Working sample rate. 48kHz keeps full speech bandwidth with headroom.
+WORK_SR = 48000
 
 
 class PipelineError(RuntimeError):
@@ -83,8 +83,9 @@ def probe_source(path: Path) -> SourceInfo:
 
 
 def extract_audio(src_path: Path, out_wav: Path) -> Path:
-    """Pull the audio out of the source video at the highest practical
-    fidelity: 48kHz / 24-bit PCM, stereo preserved."""
+    """Pull the audio out of the source at high fidelity: 48kHz / 24-bit
+    PCM, downmixed to mono (voice work is mono; it also gives the noise
+    filters a single coherent channel to operate on)."""
     cmd = [
         "ffmpeg",
         "-y",
@@ -92,9 +93,9 @@ def extract_audio(src_path: Path, out_wav: Path) -> Path:
         str(src_path),
         "-vn",
         "-ac",
-        "2",
+        "1",
         "-ar",
-        str(DENOISE_SR),
+        str(WORK_SR),
         "-c:a",
         "pcm_s24le",
         str(out_wav),
@@ -103,131 +104,7 @@ def extract_audio(src_path: Path, out_wav: Path) -> Path:
     return out_wav
 
 
-def separate_vocals(wav_path: Path, out_dir: Path, progress_cb: ProgressCB = None) -> Path:
-    """Run a UVR (Ultimate Vocal Remover) MDX-Net model to split the
-    speech/vocal content away from music, ambience, and other
-    background sound (e.g. traffic)."""
-    # Imported lazily: this pulls in torch/onnxruntime, which are heavy
-    # and unnecessary for code paths that never separate audio (tests, etc).
-    #
-    # Import numpy directly first. onnxruntime (pulled in transitively) reports
-    # *any* numpy load failure as an opaque "ImportError: import numpy failed",
-    # which hides the real cause. Importing numpy here surfaces the true error
-    # (missing shared lib, unsupported CPU, thread/allocation failure, ABI
-    # mismatch) both in the logs and in the message shown to the user.
-    try:
-        import numpy  # noqa: F401
-    except Exception as exc:  # pragma: no cover - environment-specific
-        raise PipelineError(
-            "NumPy failed to load in the processing environment "
-            f"({type(exc).__name__}: {exc}). This is an environment/runtime "
-            "issue, not a problem with your file."
-        ) from exc
-    from audio_separator.separator import Separator
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    if progress_cb:
-        progress_cb("loading separation model", 0.0)
-
-    separator = Separator(
-        output_dir=str(out_dir),
-        output_format="WAV",
-        model_file_dir=str(config.MODEL_DIR),
-        output_single_stem="Vocals",
-        normalization_threshold=0.9,
-        log_level=logging.WARNING,
-    )
-    separator.load_model(model_filename=config.SEPARATION_MODEL)
-
-    if progress_cb:
-        progress_cb("isolating voices", 0.3)
-
-    output_files = separator.separate(str(wav_path))
-    if not output_files:
-        raise PipelineError("Vocal isolation produced no output.")
-
-    vocals_path = Path(output_files[0])
-    if not vocals_path.is_absolute():
-        vocals_path = out_dir / vocals_path.name
-    if not vocals_path.exists():
-        raise PipelineError("Vocal isolation output file went missing.")
-
-    if progress_cb:
-        progress_cb("voices isolated", 1.0)
-
-    return vocals_path
-
-
-def _resample_mono(in_wav: Path, out_wav: Path, sr: int) -> Path:
-    _run([
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(in_wav),
-        "-ac",
-        "1",
-        "-ar",
-        str(sr),
-        "-c:a",
-        "pcm_s16le",
-        str(out_wav),
-    ])
-    return out_wav
-
-
-def denoise_speech(vocals_wav: Path, work_dir: Path, progress_cb: ProgressCB = None) -> Path:
-    """Run DeepFilterNet (standalone Rust CLI, model weights embedded in
-    the binary) over the isolated vocal stem to strip residual
-    broadband/environmental noise (traffic, wind, hiss, room rumble)
-    while preserving speech."""
-    if progress_cb:
-        progress_cb("preparing audio for denoising", 0.0)
-
-    mono_input = _resample_mono(vocals_wav, work_dir / "vocals_48k_mono.wav", DENOISE_SR)
-
-    if progress_cb:
-        progress_cb("removing background noise", 0.3)
-
-    out_dir = work_dir / "denoised"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    _run([config.DEEPFILTER_BIN, "--pf", "-o", str(out_dir), str(mono_input)])
-
-    out_path = out_dir / mono_input.name
-    if not out_path.exists():
-        candidates = list(out_dir.glob("*.wav"))
-        if not candidates:
-            raise PipelineError("Denoising produced no output.")
-        out_path = candidates[0]
-
-    if progress_cb:
-        progress_cb("noise removed", 1.0)
-
-    return out_path
-
-
-def master_speech(in_wav: Path, out_wav: Path, out_mp3: Path, progress_cb: ProgressCB = None) -> None:
-    """Bring quiet, barely-audible speech up to an intelligible,
-    consistent level without blowing out louder passages, then emit a
-    lossless master plus a compressed copy for quick mobile playback.
-
-    - highpass: shaves off sub-100Hz rumble (engine/traffic noise lives here)
-    - afftdn: a second, gentler FFT denoise pass on top of DeepFilterNet
-    - speechnorm: boosts quiet syllables toward audibility (this is the
-      "amplify the barely-hearable voice" step)
-    - loudnorm: final EBU R128 loudness normalization for a consistent,
-      comfortable listening level
-    """
-    if progress_cb:
-        progress_cb("boosting quiet speech", 0.0)
-
-    filter_chain = (
-        "highpass=f=90,"
-        "afftdn=nf=-25,"
-        "speechnorm=e=12.5:r=0.0001:p=0.95,"
-        "loudnorm=I=-16:TP=-1.5:LRA=11"
-    )
-
+def _filtered(in_wav: Path, out_wav: Path, filter_chain: str, sample_fmt: str = "pcm_s24le") -> Path:
     _run([
         "ffmpeg",
         "-y",
@@ -236,14 +113,67 @@ def master_speech(in_wav: Path, out_wav: Path, out_mp3: Path, progress_cb: Progr
         "-af",
         filter_chain,
         "-ar",
-        str(DENOISE_SR),
+        str(WORK_SR),
         "-c:a",
-        "pcm_s24le",
+        sample_fmt,
         str(out_wav),
     ])
+    return out_wav
+
+
+def reduce_noise(in_wav: Path, out_wav: Path, progress_cb: ProgressCB = None) -> Path:
+    """Suppress steady background noise and confine the signal to the
+    voice band.
+
+    - highpass f=80 / lowpass f=7500: drops sub-bass rumble (engines,
+      traffic, wind, HVAC hum) and high hiss that carry no speech.
+    - afftdn (two passes, noise-tracking): adaptive FFT denoiser that
+      learns the background noise profile and subtracts it -- the main
+      workhorse for "reduce the sound around the voice".
+    - anlmdn: a gentler non-local-means pass to clean up what's left
+      without chewing into the speech.
+    """
+    if progress_cb:
+        progress_cb("removing background noise", 0.1)
+
+    chain = (
+        "highpass=f=80,"
+        "lowpass=f=7500,"
+        "afftdn=nf=-28:nt=w:tn=1,"
+        "afftdn=nf=-24:nt=w:tn=1,"
+        "anlmdn=s=0.0006:p=0.002:m=15"
+    )
+    _filtered(in_wav, out_wav, chain)
 
     if progress_cb:
-        progress_cb("encoding downloadable copy", 0.7)
+        progress_cb("background noise reduced", 1.0)
+    return out_wav
+
+
+def amplify_voice(in_wav: Path, out_wav: Path, out_mp3: Path, progress_cb: ProgressCB = None) -> None:
+    """Make faint speech clearly audible without blowing out the loud
+    parts, then emit a lossless master + a compressed copy.
+
+    - speechnorm: raises quiet syllables toward a target level -- this is
+      the "amplify the barely-hearable voice" step (aggressive expansion).
+    - dynaudnorm: smooths overall loudness over time so nothing stays too
+      quiet or spikes too loud across the clip.
+    - loudnorm: final EBU R128 pass for a consistent, comfortable level.
+    - alimiter: catches any peaks so the boosted output never clips.
+    """
+    if progress_cb:
+        progress_cb("amplifying quiet speech", 0.1)
+
+    chain = (
+        "speechnorm=e=50:r=0.0004:p=0.6:c=15,"
+        "dynaudnorm=f=150:g=15:p=0.9:m=30,"
+        "loudnorm=I=-14:TP=-1.5:LRA=11,"
+        "alimiter=limit=0.95"
+    )
+    _filtered(in_wav, out_wav, chain)
+
+    if progress_cb:
+        progress_cb("encoding downloadable copy", 0.8)
 
     _run([
         "ffmpeg",
@@ -253,7 +183,7 @@ def master_speech(in_wav: Path, out_wav: Path, out_mp3: Path, progress_cb: Progr
         "-c:a",
         "libmp3lame",
         "-q:a",
-        "0",
+        "1",
         str(out_mp3),
     ])
 
