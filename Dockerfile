@@ -33,7 +33,7 @@ RUN chmod +x /usr/local/bin/deep-filter
 # install (which pins torch>=2.3 but not a variant) doesn't pull several GB of
 # unused CUDA runtime packages. torch drags in numpy 2.x here; requirements.txt
 # pins it back to a numpy<2 / onnxruntime pair that audio-separator supports.
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
