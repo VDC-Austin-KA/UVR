@@ -21,6 +21,36 @@ logger = logging.getLogger("uvr.main")
 
 app = FastAPI(title="Voice Isolation Studio")
 
+
+def _warm_up_ml_stack() -> None:
+    """Import the heavy ML stack once, in the main thread, at boot.
+
+    Two reasons this runs at import time rather than only lazily inside a
+    worker thread:
+    1. It initializes numpy's C-API in the main thread, so the first job's
+       worker-thread import can't hit any first-import-in-a-thread issue.
+    2. If numpy/onnxruntime can't load in this environment, it logs the full,
+       real traceback to the startup logs -- instead of the opaque
+       "import numpy failed" that onnxruntime raises at job time. It is wrapped
+       so a failure here never stops the app from starting (the health check
+       must still pass); jobs will then surface the real reason too.
+    """
+    try:
+        import numpy
+        import onnxruntime
+        from audio_separator.separator import Separator  # noqa: F401
+
+        logger.info(
+            "ML stack warm: numpy %s / onnxruntime %s",
+            numpy.__version__,
+            onnxruntime.__version__,
+        )
+    except Exception:
+        logger.exception("ML stack failed to import at startup")
+
+
+_warm_up_ml_stack()
+
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 MAX_UPLOAD_BYTES = config.MAX_UPLOAD_MB * 1024 * 1024
