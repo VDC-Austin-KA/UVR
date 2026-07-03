@@ -16,11 +16,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /srv
 
+# OMP/OPENBLAS/MKL/NUMEXPR thread caps: numpy's bundled OpenBLAS sizes its
+# per-thread work buffers to the host CPU count; on a many-core host with a
+# memory-capped container (as on Railway) that allocation can fail at import
+# time, which onnxruntime then reports as the opaque "import numpy failed".
+# This service does its heavy lifting in ffmpeg and onnxruntime (which manages
+# its own threads), so single-threaded BLAS is a safe, negligible-cost default.
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     UVR_MODEL_DIR=/srv/models \
     UVR_WORK_DIR=/tmp/uvr-jobs \
-    UVR_DEEPFILTER_BIN=/usr/local/bin/deep-filter
+    UVR_DEEPFILTER_BIN=/usr/local/bin/deep-filter \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1
 
 # DeepFilterNet's standalone Rust CLI: statically built, model weights
 # embedded, no torch/torchaudio version dance required for denoising.

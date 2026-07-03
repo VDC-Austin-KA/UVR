@@ -109,6 +109,20 @@ def separate_vocals(wav_path: Path, out_dir: Path, progress_cb: ProgressCB = Non
     background sound (e.g. traffic)."""
     # Imported lazily: this pulls in torch/onnxruntime, which are heavy
     # and unnecessary for code paths that never separate audio (tests, etc).
+    #
+    # Import numpy directly first. onnxruntime (pulled in transitively) reports
+    # *any* numpy load failure as an opaque "ImportError: import numpy failed",
+    # which hides the real cause. Importing numpy here surfaces the true error
+    # (missing shared lib, unsupported CPU, thread/allocation failure, ABI
+    # mismatch) both in the logs and in the message shown to the user.
+    try:
+        import numpy  # noqa: F401
+    except Exception as exc:  # pragma: no cover - environment-specific
+        raise PipelineError(
+            "NumPy failed to load in the processing environment "
+            f"({type(exc).__name__}: {exc}). This is an environment/runtime "
+            "issue, not a problem with your file."
+        ) from exc
     from audio_separator.separator import Separator
 
     out_dir.mkdir(parents=True, exist_ok=True)
