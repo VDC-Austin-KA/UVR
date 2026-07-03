@@ -29,21 +29,25 @@ ADD https://github.com/Rikorose/DeepFilterNet/releases/download/v${DEEPFILTER_VE
     /usr/local/bin/deep-filter
 RUN chmod +x /usr/local/bin/deep-filter
 
-# Install a CPU-only torch build first so the subsequent audio-separator
-# install (which pins torch>=2.3 but not a variant) doesn't pull several GB of
-# unused CUDA runtime packages. torch drags in numpy 2.x here; requirements.txt
-# pins it back to a numpy<2 / onnxruntime pair that audio-separator supports.
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+# Install CPU-only torch AND torchvision from the same index so they are an
+# ABI-matched pair. torchvision is required by onnx2torch, which audio-separator
+# imports when loading MDX models; if torchvision instead comes from the default
+# PyPI index (built against a different torch) its C ops fail to register and
+# model loading dies with "operator torchvision::nms does not exist". Installing
+# from the CPU wheel index also avoids pulling several GB of unused CUDA
+# packages. torch drags in numpy 2.x here; requirements.txt pins it back to a
+# numpy<2 / onnxruntime pair that audio-separator supports.
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Fail the build loudly if the numpy <-> onnxruntime ABI pairing ends up wrong
-# (e.g. a stale cached layer, or resolver drift onto an onnxruntime built for a
-# different numpy). Otherwise onnxruntime's C-extension only fails at runtime,
-# the first time a job hits the separation stage, with the opaque
-# "ImportError: import numpy failed" -- far better to catch it here.
-RUN python -c "import numpy, onnxruntime; from audio_separator.separator import Separator; print('deps OK -> numpy', numpy.__version__, '/ onnxruntime', onnxruntime.__version__)"
+# Exercise the full model-loading import chain at build time so a broken build
+# fails here instead of at runtime on the first job. This covers both failure
+# modes seen in practice: onnxruntime's numpy C-API import ("import numpy
+# failed") and onnx2torch's torchvision op registration ("operator
+# torchvision::nms does not exist").
+RUN python -c "import numpy, onnxruntime, torchvision, onnx2torch; from audio_separator.separator.architectures.mdx_separator import MDXSeparator; print('deps OK -> numpy', numpy.__version__, '/ onnxruntime', onnxruntime.__version__, '/ torchvision', torchvision.__version__)"
 
 COPY app ./app
 COPY static ./static
