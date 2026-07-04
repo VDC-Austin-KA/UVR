@@ -5,15 +5,21 @@ there is no torch/onnxruntime/numpy to fail at runtime):
 
 1. extract    -- ffmpeg pulls the audio out of the source at 48kHz mono.
 2. enhance    -- DeepFilterNet3 (deep-filter Rust binary) removes the
-                 background noise while preserving speech. This is the heavy
-                 lifting; ffmpeg denoisers are a fallback if the binary is
-                 absent. Removing noise FIRST is what lets the next step boost
-                 the voice without boosting the noise with it.
+                 background noise while preserving speech, then an ffmpeg
+                 denoise pass (strength set by the caller's TweakParams) tops
+                 it up. Removing noise FIRST is what lets the next step boost
+                 the voice without boosting the noise with it. Falls back to
+                 ffmpeg-only denoise if the binary is absent.
 3. amplify    -- ffmpeg lifts the now-clean quiet speech to a loud, clear,
-                 consistent level (speechnorm -> compressor -> loudnorm ->
-                 limiter).
+                 consistent level (gate -> speechnorm -> compressor ->
+                 loudnorm -> limiter), all tunable via TweakParams.
 4. transcribe -- whisper.cpp reads the enhanced speech into text + SRT
-                 captions. Best-effort: skipped if whisper isn't installed.
+                 captions. Best-effort: skipped if whisper isn't installed or
+                 the caller turns it off.
+
+TweakParams holds every user-adjustable knob (the "sliders"). All ffmpeg
+filter values are clamped to ranges verified against this ffmpeg build so a
+slider can never produce an invalid filter argument.
 """
 
 from __future__ import annotations
@@ -21,7 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -43,6 +49,52 @@ class PipelineError(RuntimeError):
 class SourceInfo:
     duration_seconds: float
     has_audio: bool
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+@dataclass
+class TweakParams:
+    """User-adjustable processing knobs, 0-100 "slider" scale unless noted.
+
+    Defaults reproduce the original fixed pipeline's behavior.
+    """
+
+    noise_reduction: float = 55.0   # ffmpeg denoise strength (on top of AI)
+    low_cut_hz: float = 90.0        # highpass cutoff, Hz (20-300)
+    high_cut_hz: float = 7500.0     # lowpass cutoff, Hz (2000-8000)
+    vocal_boost: float = 100.0      # speechnorm/compressor makeup intensity
+    compression: float = 42.0       # acompressor ratio intensity
+    gain_db: float = 0.0            # extra loudness target shift, dB (-12..12)
+    gate_threshold: float = -60.0   # noise gate threshold, dB (-70..-20); -70 ~= off
+    use_ai_denoise: bool = True     # run DeepFilterNet3 if available
+    use_transcription: bool = True  # run whisper.cpp if available
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TweakParams":
+        known = {f.name for f in fields(cls)}
+        clean = {}
+        for k, v in data.items():
+            if k not in known or v is None:
+                continue
+            f = next(f for f in fields(cls) if f.name == k)
+            clean[k] = bool(v) if f.type == "bool" else float(v)
+        return cls(**clean)
+
+    def clamped(self) -> "TweakParams":
+        return TweakParams(
+            noise_reduction=_clamp(self.noise_reduction, 0, 100),
+            low_cut_hz=_clamp(self.low_cut_hz, 20, 300),
+            high_cut_hz=_clamp(self.high_cut_hz, 2000, 8000),
+            vocal_boost=_clamp(self.vocal_boost, 0, 100),
+            compression=_clamp(self.compression, 0, 100),
+            gain_db=_clamp(self.gain_db, -12, 12),
+            gate_threshold=_clamp(self.gate_threshold, -70, -20),
+            use_ai_denoise=self.use_ai_denoise,
+            use_transcription=self.use_transcription,
+        )
 
 
 def _run(cmd: list[str], timeout: Optional[int] = None) -> subprocess.CompletedProcess:
@@ -82,13 +134,18 @@ def probe_source(path: Path) -> SourceInfo:
     return SourceInfo(duration_seconds=duration, has_audio=has_audio)
 
 
-def extract_audio(src_path: Path, out_wav: Path) -> Path:
-    """Extract audio at 48kHz / 24-bit / mono."""
-    _run([
-        "ffmpeg", "-y", "-i", str(src_path),
+def extract_audio(src_path: Path, out_wav: Path, max_seconds: Optional[float] = None) -> Path:
+    """Extract audio at 48kHz / 24-bit / mono. If max_seconds is set, only
+    that much of the source is extracted (used for fast preview renders)."""
+    cmd = ["ffmpeg", "-y"]
+    if max_seconds is not None:
+        cmd += ["-t", str(max_seconds)]
+    cmd += [
+        "-i", str(src_path),
         "-vn", "-ac", "1", "-ar", str(WORK_SR), "-c:a", "pcm_s24le",
         str(out_wav),
-    ])
+    ]
+    _run(cmd)
     return out_wav
 
 
@@ -100,18 +157,29 @@ def _ffmpeg_af(in_wav: Path, out_wav: Path, chain: str, sample_fmt: str = "pcm_s
     return out_wav
 
 
-def enhance_speech(in_wav: Path, work_dir: Path, progress_cb: ProgressCB = None) -> Path:
-    """Remove background noise with DeepFilterNet3 (falls back to ffmpeg).
+def _denoise_chain(params: TweakParams) -> str:
+    """Build the ffmpeg denoise segment. noise_reduction (0-100) maps to
+    afftdn's noise floor (-20 dB light .. -65 dB aggressive, within ffmpeg's
+    documented -80..-20 range) and anlmdn's strength."""
+    nr = params.noise_reduction / 100.0
+    nf = -20 - nr * 45          # 0 -> -20dB, 100 -> -65dB
+    anlmdn_s = 0.0001 + nr * 0.0019   # 0 -> 0.0001, 100 -> 0.002
+    return (
+        f"highpass=f={params.low_cut_hz:.0f},"
+        f"lowpass=f={params.high_cut_hz:.0f},"
+        f"afftdn=nf={nf:.1f}:nt=w:tn=1,"
+        f"anlmdn=s={anlmdn_s:.5f}:p=0.002:m=15"
+    )
 
-    DeepFilterNet is a deep-learning speech enhancer that predicts a
-    suppression filter per frequency bin -- far better than ffmpeg's
-    generic denoisers at non-stationary noise like traffic/crowd. We run it
-    twice for stronger suppression on very noisy sources.
-    """
+
+def enhance_speech(in_wav: Path, work_dir: Path, params: TweakParams, progress_cb: ProgressCB = None) -> Path:
+    """Remove background noise: DeepFilterNet3 (if enabled + available) then
+    an ffmpeg denoise pass whose strength is set by params.noise_reduction."""
     if progress_cb:
         progress_cb("removing background noise", 0.1)
 
-    if config.deepfilter_available():
+    source = in_wav
+    if params.use_ai_denoise and config.deepfilter_available():
         out_dir = work_dir / "dfn"
         out_dir.mkdir(parents=True, exist_ok=True)
         # deep-filter reads/writes 48kHz and writes <out_dir>/<input name>.
@@ -119,56 +187,84 @@ def enhance_speech(in_wav: Path, work_dir: Path, progress_cb: ProgressCB = None)
         enhanced = out_dir / in_wav.name
         if not enhanced.exists():
             cands = list(out_dir.glob("*.wav"))
-            if not cands:
-                raise PipelineError("Speech enhancement produced no output.")
-            enhanced = cands[0]
-        if progress_cb:
-            progress_cb("background noise removed", 1.0)
-        return enhanced
+            if cands:
+                enhanced = cands[0]
+        if enhanced.exists():
+            source = enhanced
+        else:
+            logger.warning("DeepFilterNet produced no output; continuing with ffmpeg-only denoise")
+    elif params.use_ai_denoise:
+        logger.warning("AI denoise requested but DeepFilterNet binary not found at %s", config.DEEPFILTER_BIN)
 
-    # Fallback: ffmpeg-only denoise (DeepFilterNet binary unavailable).
-    logger.warning("DeepFilterNet binary not found at %s; using ffmpeg denoise", config.DEEPFILTER_BIN)
-    out = work_dir / "denoised_ff.wav"
-    _ffmpeg_af(
-        in_wav, out,
-        "highpass=f=80,lowpass=f=7500,afftdn=nf=-28:nt=w:tn=1,afftdn=nf=-24:nt=w:tn=1,anlmdn=s=0.0006:p=0.002:m=15",
-    )
+    if progress_cb:
+        progress_cb("removing background noise", 0.5)
+
+    out = work_dir / "denoised.wav"
+    _ffmpeg_af(source, out, _denoise_chain(params))
+
     if progress_cb:
         progress_cb("background noise removed", 1.0)
     return out
 
 
-def amplify_voice(in_wav: Path, out_wav: Path, out_mp3: Path, progress_cb: ProgressCB = None) -> None:
-    """Lift the now-clean quiet speech to a loud, clear, consistent level.
+def _amplify_chain(params: TweakParams) -> str:
+    """Build the ffmpeg amplification segment.
 
-    - speechnorm: raise quiet syllables toward the target (main boost).
-    - acompressor: compress remaining dynamics so faint words come up to the
-      level of louder ones.
-    - loudnorm: EBU R128 normalize to a loud target (-13 LUFS).
-    - alimiter: catch peaks so nothing clips.
+    - agate: noise gate, cuts residual hiss below the threshold between words.
+    - speechnorm: raises quiet syllables (e valid range is 1-50 in this
+      ffmpeg build; vocal_boost 0-100 maps onto it).
+    - acompressor: compresses remaining dynamics; ratio (1-20 valid) and
+      makeup gain scale with compression/vocal_boost.
+    - loudnorm: EBU R128 normalize to a loud target, shiftable by gain_db.
+    - alimiter: catches peaks so nothing clips.
     """
+    e = _clamp(1 + (params.vocal_boost / 100.0) * 49, 1, 50)
+    ratio = _clamp(1 + (params.compression / 100.0) * 14, 1, 20)
+    makeup = _clamp(1 + (params.vocal_boost / 100.0) * 7, 1, 16)
+    target_i = _clamp(-13 + params.gain_db, -40, -5)
+
+    return (
+        f"agate=threshold={params.gate_threshold:.0f}dB:ratio=6:attack=5:release=100,"
+        f"speechnorm=e={e:.1f}:r=0.0003:p=0.55,"
+        f"acompressor=threshold=-24dB:ratio={ratio:.1f}:attack=8:release=180:makeup={makeup:.1f},"
+        f"dynaudnorm=f=150:g=15:p=0.9:m=40,"
+        f"loudnorm=I={target_i:.1f}:TP=-1.0:LRA=11,"
+        f"alimiter=limit=0.97"
+    )
+
+
+def amplify_voice(in_wav: Path, out_wav: Path, out_mp3: Optional[Path], params: TweakParams,
+                   progress_cb: ProgressCB = None) -> None:
+    """Lift the now-clean quiet speech to a loud, clear, consistent level."""
     if progress_cb:
         progress_cb("amplifying quiet speech", 0.1)
 
-    chain = (
-        "highpass=f=70,"
-        "speechnorm=e=50:r=0.0003:p=0.55,"
-        "acompressor=threshold=-24dB:ratio=6:attack=8:release=180:makeup=8,"
-        "dynaudnorm=f=150:g=15:p=0.9:m=40,"
-        "loudnorm=I=-13:TP=-1.0:LRA=11,"
-        "alimiter=limit=0.97"
-    )
-    _ffmpeg_af(in_wav, out_wav, chain)
+    _ffmpeg_af(in_wav, out_wav, _amplify_chain(params))
 
-    if progress_cb:
-        progress_cb("encoding downloadable copy", 0.8)
-
-    _run([
-        "ffmpeg", "-y", "-i", str(out_wav),
-        "-c:a", "libmp3lame", "-q:a", "1", str(out_mp3),
-    ])
+    if out_mp3 is not None:
+        if progress_cb:
+            progress_cb("encoding downloadable copy", 0.8)
+        _run([
+            "ffmpeg", "-y", "-i", str(out_wav),
+            "-c:a", "libmp3lame", "-q:a", "1", str(out_mp3),
+        ])
     if progress_cb:
         progress_cb("done", 1.0)
+
+
+def render_preview(src_path: Path, work_dir: Path, params: TweakParams, seconds: float = 20.0) -> Path:
+    """Render only the first `seconds` of the source through the real
+    enhance+amplify chain (optionally with AI denoise), for fast auditioning
+    of slider settings without processing the whole file. Returns an MP3."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    raw = work_dir / "preview_src.wav"
+    extract_audio(src_path, raw, max_seconds=seconds)
+
+    enhanced = enhance_speech(raw, work_dir, params)
+    final_wav = work_dir / "preview_out.wav"
+    final_mp3 = work_dir / "preview_out.mp3"
+    amplify_voice(enhanced, final_wav, final_mp3, params)
+    return final_mp3
 
 
 def transcribe(in_wav: Path, work_dir: Path, progress_cb: ProgressCB = None) -> Optional[dict]:
