@@ -100,19 +100,33 @@
   // (no real spectral noise reduction happens client-side); "Render accurate
   // preview" gets the real ffmpeg + DeepFilterNet result for a short clip.
   let audioCtx = null;
+  let graphReady = false;
   let sourceNode = null;
+  let noiseNode = null; // AudioWorklet gate + expander (may be null if unsupported)
   let highpassNode = null;
   let lowpassNode = null;
   let presenceNode = null;
   let compressorNode = null;
   let gainNode = null;
 
-  function ensureLiveGraph() {
-    if (audioCtx) return;
+  async function ensureLiveGraph() {
+    if (graphReady) return;
     const Ctx = window.AudioContext || window.webkitAudioContext;
     if (!Ctx) return; // unsupported browser: live preview just won't run
-    audioCtx = new Ctx();
-    sourceNode = audioCtx.createMediaElementSource(tuneAudio);
+    if (!audioCtx) audioCtx = new Ctx();
+
+    // Try to load the noise gate / expander worklet (needs a secure context).
+    if (audioCtx.audioWorklet) {
+      try {
+        await audioCtx.audioWorklet.addModule("/noise-worklet.js");
+        noiseNode = new AudioWorkletNode(audioCtx, "noise-reducer");
+      } catch (err) {
+        noiseNode = null; // fall back to no gate/expander in the live preview
+      }
+    }
+
+    // createMediaElementSource can only be called once per element.
+    if (!sourceNode) sourceNode = audioCtx.createMediaElementSource(tuneAudio);
     highpassNode = audioCtx.createBiquadFilter();
     highpassNode.type = "highpass";
     lowpassNode = audioCtx.createBiquadFilter();
@@ -124,7 +138,9 @@
     compressorNode = audioCtx.createDynamicsCompressor();
     gainNode = audioCtx.createGain();
 
-    sourceNode
+    let head = sourceNode;
+    if (noiseNode) head = head.connect(noiseNode);
+    head
       .connect(highpassNode)
       .connect(lowpassNode)
       .connect(presenceNode)
@@ -132,11 +148,12 @@
       .connect(gainNode)
       .connect(audioCtx.destination);
 
+    graphReady = true;
     updateLiveGraph();
   }
 
   function updateLiveGraph() {
-    if (!audioCtx) return;
+    if (!graphReady || !audioCtx) return;
     const p = currentParams();
     const now = audioCtx.currentTime;
     highpassNode.frequency.setTargetAtTime(p.low_cut_hz, now, 0.02);
@@ -145,6 +162,16 @@
     compressorNode.threshold.setTargetAtTime(-24 - (p.compression / 100) * 20, now, 0.02);
     compressorNode.ratio.setTargetAtTime(1 + (p.compression / 100) * 11, now, 0.02);
     gainNode.gain.setTargetAtTime(Math.pow(10, p.gain_db / 20), now, 0.02);
+    if (noiseNode) {
+      // DeepFilterNet can't run in the browser, so when "AI noise removal" is
+      // on we drive the live gate/expander a bit harder as a rough stand-in so
+      // the toggle audibly does something; the real AI denoise is applied in
+      // Render accurate preview and the full run.
+      const aiBump = aiToggle.checked ? 0.2 : 0.0;
+      const reduction = Math.min(1, p.noise_reduction / 100 + aiBump);
+      noiseNode.parameters.get("gateThreshold").setValueAtTime(p.gate_threshold, now);
+      noiseNode.parameters.get("reduction").setValueAtTime(reduction, now);
+    }
   }
 
   function formatBytes(bytes) {
@@ -187,8 +214,8 @@
     pickFile(file);
   });
 
-  tuneAudio.addEventListener("play", () => {
-    ensureLiveGraph();
+  tuneAudio.addEventListener("play", async () => {
+    await ensureLiveGraph();
     if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
   });
 
@@ -198,6 +225,9 @@
       updateLiveGraph();
     });
   }
+  // The AI-denoise toggle nudges the live gate/expander (a rough stand-in for
+  // DeepFilterNet, which can't run in the browser), so refresh on change.
+  aiToggle.addEventListener("change", updateLiveGraph);
 
   startBtn.addEventListener("click", () => {
     if (chosenFile) startJob(chosenFile, DEFAULTS);
