@@ -35,17 +35,19 @@
     <section id="tune-card" class="card" hidden>
       <h2>Tune it before processing</h2>
       <p class="muted">
-        Drag a slider to hear an instant tone preview. Tap
-        <strong>Render accurate preview</strong> to hear the real noise
-        removal (DeepFilterNet + these settings) on the first 20 seconds.
+        Press play, then drag the sliders to hear the change instantly (EQ,
+        volume, compression, noise gate and a rough noise-reduction expander all
+        run live in your browser). The AI denoiser can't run in the browser, so
+        tap <strong>Render accurate preview</strong> to hear the real
+        DeepFilterNet result on the first 20 seconds.
       </p>
 
       <div class="player-block">
-        <div class="player-label">Live rough preview (tone/gain only, instant)</div>
+        <div class="player-label">Live preview (instant, in-browser)</div>
         <audio id="tune-audio" controls preload="none"></audio>
       </div>
       <div id="rendered-block" class="player-block" hidden>
-        <div class="player-label">Accurate preview (real noise removal, first 20s)</div>
+        <div class="player-label">Accurate preview (real AI noise removal, first 20s)</div>
         <audio id="rendered-audio" controls preload="none"></audio>
       </div>
 
@@ -89,6 +91,10 @@
         <label><input id="s-ai" type="checkbox" checked /> AI noise removal (DeepFilterNet)</label>
         <label><input id="s-transcribe" type="checkbox" checked /> Transcribe speech (Whisper)</label>
       </div>
+      <p class="muted" style="margin:0.2rem 0 0; font-size:0.8rem;">
+        AI noise removal and transcription run on the server &mdash; use
+        <strong>Render accurate preview</strong> (or the full run) to hear/get them.
+      </p>
 
       <div class="download-row">
         <button id="preview-btn" class="btn">Render accurate preview (20s)</button>
