@@ -66,7 +66,12 @@ class JobManager:
         self._janitor = threading.Thread(target=self._janitor_loop, daemon=True)
         self._janitor.start()
 
-    def create_job(self, upload_path: Path, original_filename: str) -> Job:
+    def create_job(
+        self,
+        upload_path: Path,
+        original_filename: str,
+        params: Optional[pipeline.TweakParams] = None,
+    ) -> Job:
         job_id = uuid.uuid4().hex[:12]
         work_dir = config.WORK_DIR / job_id
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -75,7 +80,7 @@ class JobManager:
         with self._lock:
             self._jobs[job_id] = job
 
-        self._executor.submit(self._run, job, upload_path)
+        self._executor.submit(self._run, job, upload_path, (params or pipeline.TweakParams()).clamped())
         return job
 
     def get(self, job_id: str) -> Optional[Job]:
@@ -87,7 +92,7 @@ class JobManager:
         job.stage_progress = progress
         logger.info("job %s -> %s (%.0f%%)", job.id, status, progress * 100)
 
-    def _run(self, job: Job, upload_path: Path) -> None:
+    def _run(self, job: Job, upload_path: Path, params: pipeline.TweakParams) -> None:
         assert job.work_dir is not None
         work_dir = job.work_dir
         try:
@@ -107,6 +112,7 @@ class JobManager:
             enhanced_path = pipeline.enhance_speech(
                 original_wav,
                 work_dir,
+                params,
                 progress_cb=lambda _stage, pct: self._set_stage(
                     job, "removing background noise", pct
                 ),
@@ -119,6 +125,7 @@ class JobManager:
                 enhanced_path,
                 final_wav,
                 final_mp3,
+                params,
                 progress_cb=lambda _stage, pct: self._set_stage(
                     job, "amplifying quiet speech", pct
                 ),
@@ -126,20 +133,21 @@ class JobManager:
             job.result_files["voice_clean.wav"] = final_wav
             job.result_files["voice_clean.mp3"] = final_mp3
 
-            self._set_stage(job, "transcribing speech", 0.0)
-            result = pipeline.transcribe(
-                final_wav,
-                work_dir,
-                progress_cb=lambda _stage, pct: self._set_stage(
-                    job, "transcribing speech", pct
-                ),
-            )
-            if result:
-                job.transcript = result["text"]
-                if result["txt"].exists():
-                    job.result_files["transcript.txt"] = result["txt"]
-                if result["srt"].exists():
-                    job.result_files["captions.srt"] = result["srt"]
+            if params.use_transcription:
+                self._set_stage(job, "transcribing speech", 0.0)
+                result = pipeline.transcribe(
+                    final_wav,
+                    work_dir,
+                    progress_cb=lambda _stage, pct: self._set_stage(
+                        job, "transcribing speech", pct
+                    ),
+                )
+                if result:
+                    job.transcript = result["text"]
+                    if result["txt"].exists():
+                        job.result_files["transcript.txt"] = result["txt"]
+                    if result["srt"].exists():
+                        job.result_files["captions.srt"] = result["srt"]
 
             self._set_stage(job, "done", 1.0)
         except pipeline.PipelineError as exc:

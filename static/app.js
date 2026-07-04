@@ -5,6 +5,7 @@
   const startBtn = document.getElementById("start-btn");
 
   const uploadCard = document.getElementById("upload-card");
+  const tuneCard = document.getElementById("tune-card");
   const progressCard = document.getElementById("progress-card");
   const errorCard = document.getElementById("error-card");
   const resultCard = document.getElementById("result-card");
@@ -24,13 +25,126 @@
   const transcriptBlock = document.getElementById("transcript-block");
   const transcriptText = document.getElementById("transcript-text");
 
+  // --- Tune panel elements ---
+  const tuneAudio = document.getElementById("tune-audio");
+  const renderedBlock = document.getElementById("rendered-block");
+  const renderedAudio = document.getElementById("rendered-audio");
+  const previewBtn = document.getElementById("preview-btn");
+  const resetBtn = document.getElementById("reset-btn");
+  const previewStatus = document.getElementById("preview-status");
+  const tuneStartBtn = document.getElementById("tune-start-btn");
+
+  const DEFAULTS = {
+    noise_reduction: 55,
+    low_cut_hz: 90,
+    high_cut_hz: 7500,
+    vocal_boost: 100,
+    compression: 42,
+    gain_db: 0,
+    gate_threshold: -60,
+    use_ai_denoise: true,
+    use_transcription: true,
+  };
+
+  const sliders = {
+    noise_reduction: document.getElementById("s-noise"),
+    low_cut_hz: document.getElementById("s-lowcut"),
+    high_cut_hz: document.getElementById("s-highcut"),
+    vocal_boost: document.getElementById("s-boost"),
+    compression: document.getElementById("s-comp"),
+    gain_db: document.getElementById("s-gain"),
+    gate_threshold: document.getElementById("s-gate"),
+  };
+  const sliderVals = {
+    noise_reduction: document.getElementById("s-noise-val"),
+    low_cut_hz: document.getElementById("s-lowcut-val"),
+    high_cut_hz: document.getElementById("s-highcut-val"),
+    vocal_boost: document.getElementById("s-boost-val"),
+    compression: document.getElementById("s-comp-val"),
+    gain_db: document.getElementById("s-gain-val"),
+    gate_threshold: document.getElementById("s-gate-val"),
+  };
+  const aiToggle = document.getElementById("s-ai");
+  const transcribeToggle = document.getElementById("s-transcribe");
+
   let chosenFile = null;
   let pollTimer = null;
+  let fileObjectUrl = null;
 
-  function showOnly(card) {
-    for (const c of [uploadCard, progressCard, errorCard, resultCard]) {
-      c.hidden = c !== card;
+  function currentParams() {
+    return {
+      noise_reduction: Number(sliders.noise_reduction.value),
+      low_cut_hz: Number(sliders.low_cut_hz.value),
+      high_cut_hz: Number(sliders.high_cut_hz.value),
+      vocal_boost: Number(sliders.vocal_boost.value),
+      compression: Number(sliders.compression.value),
+      gain_db: Number(sliders.gain_db.value),
+      gate_threshold: Number(sliders.gate_threshold.value),
+      use_ai_denoise: aiToggle.checked,
+      use_transcription: transcribeToggle.checked,
+    };
+  }
+
+  function applyDefaultsToControls() {
+    for (const key of Object.keys(sliders)) {
+      sliders[key].value = DEFAULTS[key];
+      sliderVals[key].textContent = DEFAULTS[key];
     }
+    aiToggle.checked = DEFAULTS.use_ai_denoise;
+    transcribeToggle.checked = DEFAULTS.use_transcription;
+  }
+
+  // --- Live rough preview via Web Audio API ---
+  // Instant tone/gain/gate-ish feedback while dragging sliders, using the
+  // locally chosen file -- no server round-trip. This is an approximation
+  // (no real spectral noise reduction happens client-side); "Render accurate
+  // preview" gets the real ffmpeg + DeepFilterNet result for a short clip.
+  let audioCtx = null;
+  let sourceNode = null;
+  let highpassNode = null;
+  let lowpassNode = null;
+  let presenceNode = null;
+  let compressorNode = null;
+  let gainNode = null;
+
+  function ensureLiveGraph() {
+    if (audioCtx) return;
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return; // unsupported browser: live preview just won't run
+    audioCtx = new Ctx();
+    sourceNode = audioCtx.createMediaElementSource(tuneAudio);
+    highpassNode = audioCtx.createBiquadFilter();
+    highpassNode.type = "highpass";
+    lowpassNode = audioCtx.createBiquadFilter();
+    lowpassNode.type = "lowpass";
+    presenceNode = audioCtx.createBiquadFilter();
+    presenceNode.type = "peaking";
+    presenceNode.frequency.value = 2500;
+    presenceNode.Q.value = 1;
+    compressorNode = audioCtx.createDynamicsCompressor();
+    gainNode = audioCtx.createGain();
+
+    sourceNode
+      .connect(highpassNode)
+      .connect(lowpassNode)
+      .connect(presenceNode)
+      .connect(compressorNode)
+      .connect(gainNode)
+      .connect(audioCtx.destination);
+
+    updateLiveGraph();
+  }
+
+  function updateLiveGraph() {
+    if (!audioCtx) return;
+    const p = currentParams();
+    const now = audioCtx.currentTime;
+    highpassNode.frequency.setTargetAtTime(p.low_cut_hz, now, 0.02);
+    lowpassNode.frequency.setTargetAtTime(p.high_cut_hz, now, 0.02);
+    presenceNode.gain.setTargetAtTime((p.vocal_boost / 100) * 12, now, 0.02);
+    compressorNode.threshold.setTargetAtTime(-24 - (p.compression / 100) * 20, now, 0.02);
+    compressorNode.ratio.setTargetAtTime(1 + (p.compression / 100) * 11, now, 0.02);
+    gainNode.gain.setTargetAtTime(Math.pow(10, p.gain_db / 20), now, 0.02);
   }
 
   function formatBytes(bytes) {
@@ -44,6 +158,14 @@
     selectedFile.hidden = false;
     selectedFile.textContent = `${file.name} (${formatBytes(file.size)})`;
     startBtn.disabled = false;
+
+    if (fileObjectUrl) URL.revokeObjectURL(fileObjectUrl);
+    fileObjectUrl = URL.createObjectURL(file);
+    tuneAudio.src = fileObjectUrl;
+
+    renderedBlock.hidden = true;
+    previewStatus.textContent = "";
+    tuneCard.hidden = false;
   }
 
   fileInput.addEventListener("change", () => pickFile(fileInput.files[0]));
@@ -65,9 +187,32 @@
     pickFile(file);
   });
 
-  startBtn.addEventListener("click", () => {
-    if (chosenFile) startJob(chosenFile);
+  tuneAudio.addEventListener("play", () => {
+    ensureLiveGraph();
+    if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
   });
+
+  for (const key of Object.keys(sliders)) {
+    sliders[key].addEventListener("input", () => {
+      sliderVals[key].textContent = sliders[key].value;
+      updateLiveGraph();
+    });
+  }
+
+  startBtn.addEventListener("click", () => {
+    if (chosenFile) startJob(chosenFile, DEFAULTS);
+  });
+  tuneStartBtn.addEventListener("click", () => {
+    if (chosenFile) startJob(chosenFile, currentParams());
+  });
+  resetBtn.addEventListener("click", () => {
+    applyDefaultsToControls();
+    updateLiveGraph();
+  });
+  previewBtn.addEventListener("click", () => {
+    if (chosenFile) renderAccuratePreview(chosenFile);
+  });
+
   retryBtn.addEventListener("click", resetToUpload);
   newBtn.addEventListener("click", resetToUpload);
 
@@ -76,8 +221,16 @@
     fileInput.value = "";
     selectedFile.hidden = true;
     startBtn.disabled = true;
+    tuneCard.hidden = true;
     if (pollTimer) clearTimeout(pollTimer);
     showOnly(uploadCard);
+  }
+
+  function showOnly(card) {
+    for (const c of [uploadCard, progressCard, errorCard, resultCard]) {
+      c.hidden = c !== card;
+    }
+    if (card !== uploadCard) tuneCard.hidden = true;
   }
 
   function setStage(stageName) {
@@ -94,13 +247,47 @@
     }
   }
 
-  async function startJob(file) {
+  function paramsToFormFields(form, params) {
+    for (const [k, v] of Object.entries(params)) {
+      form.append(k, typeof v === "boolean" ? String(v) : v);
+    }
+  }
+
+  async function renderAccuratePreview(file) {
+    previewBtn.disabled = true;
+    previewStatus.textContent = "Rendering real preview… this can take a little while.";
+
+    const form = new FormData();
+    form.append("file", file);
+    paramsToFormFields(form, currentParams());
+
+    try {
+      const resp = await fetch("/api/preview", { method: "POST", body: form });
+      if (!resp.ok) {
+        const detail = await safeDetail(resp);
+        previewStatus.textContent = detail || "Preview render failed.";
+        return;
+      }
+      const blob = await resp.blob();
+      renderedAudio.src = URL.createObjectURL(blob);
+      renderedBlock.hidden = false;
+      previewStatus.textContent = "Preview ready — press play above.";
+      renderedAudio.play().catch(() => {});
+    } catch {
+      previewStatus.textContent = "Preview failed — check your connection and try again.";
+    } finally {
+      previewBtn.disabled = false;
+    }
+  }
+
+  async function startJob(file, params) {
     showOnly(progressCard);
     setStage("extracting audio");
     progressFill.style.width = "0%";
 
     const form = new FormData();
     form.append("file", file);
+    paramsToFormFields(form, params);
 
     let resp;
     try {

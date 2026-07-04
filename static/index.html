@@ -32,6 +32,73 @@
       <button id="start-btn" class="btn btn--primary" disabled>Clean up the audio</button>
     </section>
 
+    <section id="tune-card" class="card" hidden>
+      <h2>Tune it before processing</h2>
+      <p class="muted">
+        Drag a slider to hear an instant tone preview. Tap
+        <strong>Render accurate preview</strong> to hear the real noise
+        removal (DeepFilterNet + these settings) on the first 20 seconds.
+      </p>
+
+      <div class="player-block">
+        <div class="player-label">Live rough preview (tone/gain only, instant)</div>
+        <audio id="tune-audio" controls preload="none"></audio>
+      </div>
+      <div id="rendered-block" class="player-block" hidden>
+        <div class="player-label">Accurate preview (real noise removal, first 20s)</div>
+        <audio id="rendered-audio" controls preload="none"></audio>
+      </div>
+
+      <div class="slider-row">
+        <label for="s-noise">Noise reduction</label>
+        <input id="s-noise" type="range" min="0" max="100" value="55" />
+        <span id="s-noise-val" class="slider-val">55</span>
+      </div>
+      <div class="slider-row">
+        <label for="s-lowcut">Low cut (Hz)</label>
+        <input id="s-lowcut" type="range" min="20" max="300" value="90" />
+        <span id="s-lowcut-val" class="slider-val">90</span>
+      </div>
+      <div class="slider-row">
+        <label for="s-highcut">High cut (Hz)</label>
+        <input id="s-highcut" type="range" min="2000" max="8000" value="7500" />
+        <span id="s-highcut-val" class="slider-val">7500</span>
+      </div>
+      <div class="slider-row">
+        <label for="s-boost">Vocal boost</label>
+        <input id="s-boost" type="range" min="0" max="100" value="100" />
+        <span id="s-boost-val" class="slider-val">100</span>
+      </div>
+      <div class="slider-row">
+        <label for="s-comp">Compression</label>
+        <input id="s-comp" type="range" min="0" max="100" value="42" />
+        <span id="s-comp-val" class="slider-val">42</span>
+      </div>
+      <div class="slider-row">
+        <label for="s-gain">Overall volume (dB)</label>
+        <input id="s-gain" type="range" min="-12" max="12" value="0" />
+        <span id="s-gain-val" class="slider-val">0</span>
+      </div>
+      <div class="slider-row">
+        <label for="s-gate">Noise gate (dB)</label>
+        <input id="s-gate" type="range" min="-70" max="-20" value="-60" />
+        <span id="s-gate-val" class="slider-val">-60</span>
+      </div>
+
+      <div class="toggle-row">
+        <label><input id="s-ai" type="checkbox" checked /> AI noise removal (DeepFilterNet)</label>
+        <label><input id="s-transcribe" type="checkbox" checked /> Transcribe speech (Whisper)</label>
+      </div>
+
+      <div class="download-row">
+        <button id="preview-btn" class="btn">Render accurate preview (20s)</button>
+        <button id="reset-btn" class="btn btn--ghost">Reset to defaults</button>
+      </div>
+      <p id="preview-status" class="muted"></p>
+
+      <button id="tune-start-btn" class="btn btn--primary">Process full file with these settings</button>
+    </section>
+
     <section id="progress-card" class="card" hidden>
       <h2>Processing&hellip;</h2>
       <div class="progress-bar">

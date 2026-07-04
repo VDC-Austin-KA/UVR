@@ -4,16 +4,19 @@ description."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import shutil
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
-from app import config
+from app import config, pipeline
 from app.jobs import manager
 
 logging.basicConfig(level=logging.INFO)
@@ -33,24 +36,38 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+async def _save_upload(file: UploadFile, dest: Path) -> int:
+    written = 0
+    with open(dest, "wb") as out:
+        while chunk := await file.read(CHUNK_SIZE):
+            written += len(chunk)
+            if written > MAX_UPLOAD_BYTES:
+                raise HTTPException(413, f"File exceeds the {config.MAX_UPLOAD_MB}MB limit.")
+            out.write(chunk)
+    return written
+
+
 @app.post("/api/jobs")
-async def create_job(file: UploadFile = File(...)) -> JSONResponse:
+async def create_job(
+    file: UploadFile = File(...),
+    noise_reduction: float = Form(55.0),
+    low_cut_hz: float = Form(90.0),
+    high_cut_hz: float = Form(7500.0),
+    vocal_boost: float = Form(100.0),
+    compression: float = Form(42.0),
+    gain_db: float = Form(0.0),
+    gate_threshold: float = Form(-60.0),
+    use_ai_denoise: bool = Form(True),
+    use_transcription: bool = Form(True),
+) -> JSONResponse:
     if not file.filename:
         raise HTTPException(400, "No file provided.")
 
     suffix = SAFE_SUFFIX.sub("_", Path(file.filename).suffix or ".bin")[:10]
     upload_path = config.WORK_DIR / f"upload-{uuid.uuid4().hex[:12]}{suffix}"
 
-    written = 0
     try:
-        with open(upload_path, "wb") as out:
-            while chunk := await file.read(CHUNK_SIZE):
-                written += len(chunk)
-                if written > MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        413, f"File exceeds the {config.MAX_UPLOAD_MB}MB limit."
-                    )
-                out.write(chunk)
+        written = await _save_upload(file, upload_path)
     except HTTPException:
         upload_path.unlink(missing_ok=True)
         raise
@@ -63,8 +80,87 @@ async def create_job(file: UploadFile = File(...)) -> JSONResponse:
         upload_path.unlink(missing_ok=True)
         raise HTTPException(400, "Uploaded file is empty.")
 
-    job = manager.create_job(upload_path, file.filename)
+    tweak = pipeline.TweakParams(
+        noise_reduction=noise_reduction,
+        low_cut_hz=low_cut_hz,
+        high_cut_hz=high_cut_hz,
+        vocal_boost=vocal_boost,
+        compression=compression,
+        gain_db=gain_db,
+        gate_threshold=gate_threshold,
+        use_ai_denoise=use_ai_denoise,
+        use_transcription=use_transcription,
+    ).clamped()
+
+    job = manager.create_job(upload_path, file.filename, tweak)
     return JSONResponse(job.to_public_dict(), status_code=202)
+
+
+@app.post("/api/preview")
+async def preview(
+    file: UploadFile = File(...),
+    noise_reduction: float = Form(55.0),
+    low_cut_hz: float = Form(90.0),
+    high_cut_hz: float = Form(7500.0),
+    vocal_boost: float = Form(100.0),
+    compression: float = Form(42.0),
+    gain_db: float = Form(0.0),
+    gate_threshold: float = Form(-60.0),
+    use_ai_denoise: bool = Form(True),
+) -> FileResponse:
+    """Render just the first ~20s of the source through the real
+    enhance+amplify chain so the user can audition slider settings quickly,
+    without waiting for (or paying the cost of) processing the whole file."""
+    if not file.filename:
+        raise HTTPException(400, "No file provided.")
+
+    preview_dir = config.WORK_DIR / f"preview-{uuid.uuid4().hex[:12]}"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    suffix = SAFE_SUFFIX.sub("_", Path(file.filename).suffix or ".bin")[:10]
+    upload_path = preview_dir / f"src{suffix}"
+
+    try:
+        written = await _save_upload(file, upload_path)
+    except HTTPException:
+        shutil.rmtree(preview_dir, ignore_errors=True)
+        raise
+    except Exception:
+        shutil.rmtree(preview_dir, ignore_errors=True)
+        logger.exception("preview upload failed")
+        raise HTTPException(500, "Upload failed.")
+
+    if written == 0:
+        shutil.rmtree(preview_dir, ignore_errors=True)
+        raise HTTPException(400, "Uploaded file is empty.")
+
+    tweak = pipeline.TweakParams(
+        noise_reduction=noise_reduction,
+        low_cut_hz=low_cut_hz,
+        high_cut_hz=high_cut_hz,
+        vocal_boost=vocal_boost,
+        compression=compression,
+        gain_db=gain_db,
+        gate_threshold=gate_threshold,
+        use_ai_denoise=use_ai_denoise,
+        use_transcription=False,
+    ).clamped()
+
+    try:
+        mp3_path = await asyncio.to_thread(pipeline.render_preview, upload_path, preview_dir, tweak, 20.0)
+    except pipeline.PipelineError as exc:
+        shutil.rmtree(preview_dir, ignore_errors=True)
+        raise HTTPException(422, str(exc))
+    except Exception:
+        shutil.rmtree(preview_dir, ignore_errors=True)
+        logger.exception("preview render failed")
+        raise HTTPException(500, "Preview render failed.")
+
+    return FileResponse(
+        mp3_path,
+        media_type="audio/mpeg",
+        filename="preview.mp3",
+        background=BackgroundTask(shutil.rmtree, preview_dir, ignore_errors=True),
+    )
 
 
 @app.get("/api/jobs/{job_id}")

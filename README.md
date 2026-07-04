@@ -27,6 +27,36 @@ It's a plain, mobile-friendly web page — no app-store install needed. Open the
 Railway URL on your iPhone in Safari and use it like any other site; tap
 **Share → Add to Home Screen** if you want it to behave like an app icon.
 
+## Tuning sliders
+
+After picking a file, a tuning panel appears with sliders for every processing
+knob before you commit to the full run:
+
+| Slider | Effect |
+|---|---|
+| Noise reduction | Strength of the ffmpeg spectral denoise pass (on top of DeepFilterNet) |
+| Low cut / High cut | Band-limits the signal to the voice range |
+| Vocal boost | How hard quiet speech gets lifted |
+| Compression | Evens out loud vs. quiet syllables |
+| Overall volume | Final loudness target shift |
+| Noise gate | Cuts residual hiss between words |
+| AI noise removal | Toggles DeepFilterNet3 on/off |
+| Transcribe speech | Toggles Whisper on/off (skip it for a faster run) |
+
+Two ways to audition a setting before running the full file:
+- **Live rough preview** — dragging a slider updates a Web Audio graph
+  (EQ/gain/compression) on the locally loaded file *instantly*, no server
+  round-trip. It's an approximation (no real spectral noise reduction happens
+  in-browser) meant for fast, rough tuning by ear.
+- **Render accurate preview** — sends the current slider values to the server,
+  which runs the *real* chain (ffmpeg + DeepFilterNet if enabled) on just the
+  first 20 seconds and hands back a short MP3. This is what the full run will
+  actually sound like.
+
+Once you're happy, **Process full file with these settings** runs the complete
+pipeline with the chosen values. The plain **Clean up the audio** button on the
+upload screen skips tuning and uses sensible defaults.
+
 ## Why native binaries, not the Python ML stack
 
 An earlier version used a Python machine-learning stack (torch + onnxruntime +
@@ -104,3 +134,10 @@ python scripts/smoke_test.py /path/to/clip.mp4   # or your own file
 - **Noise reduction, not source separation.** This lifts speech out of
   ambient/broadband noise; it does not separate overlapping speakers or strip
   musical accompaniment the way a dedicated separation model would.
+- **Can't recover speech below the noise floor.** If a voice is quieter than
+  the surrounding noise in the original recording, no amount of processing
+  (this tool or otherwise) can reliably reconstruct the words — there's no
+  signal left to lift. Pushing sliders to extremes on such audio tends to
+  produce artifacts that Whisper can confidently mis-transcribe into
+  plausible-sounding but entirely fabricated text; always sanity-check a
+  transcript against the audio, especially at low confidence.
