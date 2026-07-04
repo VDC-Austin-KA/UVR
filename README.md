@@ -36,11 +36,15 @@ knob before you commit to the full run:
 |---|---|
 | Noise reduction | Strength of the ffmpeg spectral denoise pass (on top of DeepFilterNet) |
 | Low cut / High cut | Band-limits the signal to the voice range |
+| Voice EQ freq / boost | A peaking EQ band — sweep the frequency to the voices and boost (or cut) that band |
+| Hum notch freq / depth | A narrow cut to kill a steady tonal noise (engine whine, hum); freq 0 = off |
 | Vocal boost | How hard quiet speech gets lifted |
 | Compression | Evens out loud vs. quiet syllables |
 | Overall volume | Final loudness target shift |
 | Noise gate | Cuts residual hiss between words |
+| AI denoise strength | How aggressively DeepFilterNet may suppress (caps its attenuation) |
 | AI noise removal | Toggles DeepFilterNet3 on/off |
+| AI post-filter | DeepFilterNet's stronger post-filter mode |
 | Transcribe speech | Toggles Whisper on/off (skip it for a faster run) |
 
 Two ways to audition a setting before running the full file:

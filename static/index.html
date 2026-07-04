@@ -67,6 +67,26 @@
         <span id="s-highcut-val" class="slider-val">7500</span>
       </div>
       <div class="slider-row">
+        <label for="s-eqfreq">Voice EQ freq (Hz)</label>
+        <input id="s-eqfreq" type="range" min="300" max="6000" value="2500" />
+        <span id="s-eqfreq-val" class="slider-val">2500</span>
+      </div>
+      <div class="slider-row">
+        <label for="s-eqgain">Voice EQ boost (dB)</label>
+        <input id="s-eqgain" type="range" min="-15" max="15" value="0" />
+        <span id="s-eqgain-val" class="slider-val">0</span>
+      </div>
+      <div class="slider-row">
+        <label for="s-notchfreq">Hum notch freq (Hz, 0=off)</label>
+        <input id="s-notchfreq" type="range" min="0" max="3000" value="0" />
+        <span id="s-notchfreq-val" class="slider-val">0</span>
+      </div>
+      <div class="slider-row">
+        <label for="s-notchdb">Hum notch depth (dB)</label>
+        <input id="s-notchdb" type="range" min="-40" max="0" value="-18" />
+        <span id="s-notchdb-val" class="slider-val">-18</span>
+      </div>
+      <div class="slider-row">
         <label for="s-boost">Vocal boost</label>
         <input id="s-boost" type="range" min="0" max="100" value="100" />
         <span id="s-boost-val" class="slider-val">100</span>
@@ -86,9 +106,15 @@
         <input id="s-gate" type="range" min="-70" max="-20" value="-60" />
         <span id="s-gate-val" class="slider-val">-60</span>
       </div>
+      <div class="slider-row">
+        <label for="s-dfstrength">AI denoise strength</label>
+        <input id="s-dfstrength" type="range" min="0" max="100" value="100" />
+        <span id="s-dfstrength-val" class="slider-val">100</span>
+      </div>
 
       <div class="toggle-row">
         <label><input id="s-ai" type="checkbox" checked /> AI noise removal (DeepFilterNet)</label>
+        <label><input id="s-dfpf" type="checkbox" /> AI post-filter (stronger)</label>
         <label><input id="s-transcribe" type="checkbox" checked /> Transcribe speech (Whisper)</label>
       </div>
       <p class="muted" style="margin:0.2rem 0 0; font-size:0.8rem;">

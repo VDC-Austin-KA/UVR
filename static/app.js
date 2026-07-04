@@ -38,11 +38,17 @@
     noise_reduction: 55,
     low_cut_hz: 90,
     high_cut_hz: 7500,
+    eq_freq: 2500,
+    eq_gain: 0,
+    notch_freq: 0,
+    notch_db: -18,
     vocal_boost: 100,
     compression: 42,
     gain_db: 0,
     gate_threshold: -60,
+    df_strength: 100,
     use_ai_denoise: true,
+    df_postfilter: false,
     use_transcription: true,
   };
 
@@ -50,21 +56,32 @@
     noise_reduction: document.getElementById("s-noise"),
     low_cut_hz: document.getElementById("s-lowcut"),
     high_cut_hz: document.getElementById("s-highcut"),
+    eq_freq: document.getElementById("s-eqfreq"),
+    eq_gain: document.getElementById("s-eqgain"),
+    notch_freq: document.getElementById("s-notchfreq"),
+    notch_db: document.getElementById("s-notchdb"),
     vocal_boost: document.getElementById("s-boost"),
     compression: document.getElementById("s-comp"),
     gain_db: document.getElementById("s-gain"),
     gate_threshold: document.getElementById("s-gate"),
+    df_strength: document.getElementById("s-dfstrength"),
   };
   const sliderVals = {
     noise_reduction: document.getElementById("s-noise-val"),
     low_cut_hz: document.getElementById("s-lowcut-val"),
     high_cut_hz: document.getElementById("s-highcut-val"),
+    eq_freq: document.getElementById("s-eqfreq-val"),
+    eq_gain: document.getElementById("s-eqgain-val"),
+    notch_freq: document.getElementById("s-notchfreq-val"),
+    notch_db: document.getElementById("s-notchdb-val"),
     vocal_boost: document.getElementById("s-boost-val"),
     compression: document.getElementById("s-comp-val"),
     gain_db: document.getElementById("s-gain-val"),
     gate_threshold: document.getElementById("s-gate-val"),
+    df_strength: document.getElementById("s-dfstrength-val"),
   };
   const aiToggle = document.getElementById("s-ai");
+  const dfPostfilterToggle = document.getElementById("s-dfpf");
   const transcribeToggle = document.getElementById("s-transcribe");
 
   let chosenFile = null;
@@ -76,11 +93,17 @@
       noise_reduction: Number(sliders.noise_reduction.value),
       low_cut_hz: Number(sliders.low_cut_hz.value),
       high_cut_hz: Number(sliders.high_cut_hz.value),
+      eq_freq: Number(sliders.eq_freq.value),
+      eq_gain: Number(sliders.eq_gain.value),
+      notch_freq: Number(sliders.notch_freq.value),
+      notch_db: Number(sliders.notch_db.value),
       vocal_boost: Number(sliders.vocal_boost.value),
       compression: Number(sliders.compression.value),
       gain_db: Number(sliders.gain_db.value),
       gate_threshold: Number(sliders.gate_threshold.value),
+      df_strength: Number(sliders.df_strength.value),
       use_ai_denoise: aiToggle.checked,
+      df_postfilter: dfPostfilterToggle.checked,
       use_transcription: transcribeToggle.checked,
     };
   }
@@ -91,6 +114,7 @@
       sliderVals[key].textContent = DEFAULTS[key];
     }
     aiToggle.checked = DEFAULTS.use_ai_denoise;
+    dfPostfilterToggle.checked = DEFAULTS.df_postfilter;
     transcribeToggle.checked = DEFAULTS.use_transcription;
   }
 
@@ -105,6 +129,8 @@
   let noiseNode = null; // AudioWorklet gate + expander (may be null if unsupported)
   let highpassNode = null;
   let lowpassNode = null;
+  let notchNode = null;
+  let eqNode = null;
   let presenceNode = null;
   let compressorNode = null;
   let gainNode = null;
@@ -131,6 +157,16 @@
     highpassNode.type = "highpass";
     lowpassNode = audioCtx.createBiquadFilter();
     lowpassNode.type = "lowpass";
+    // A narrow peaking cut (not a fixed "notch" type) so its depth is tunable,
+    // matching the server-side ffmpeg equalizer notch.
+    notchNode = audioCtx.createBiquadFilter();
+    notchNode.type = "peaking";
+    notchNode.frequency.value = 1000;
+    notchNode.Q.value = 8;
+    eqNode = audioCtx.createBiquadFilter();
+    eqNode.type = "peaking";
+    eqNode.frequency.value = 2500;
+    eqNode.Q.value = 1.4;
     presenceNode = audioCtx.createBiquadFilter();
     presenceNode.type = "peaking";
     presenceNode.frequency.value = 2500;
@@ -143,6 +179,8 @@
     head
       .connect(highpassNode)
       .connect(lowpassNode)
+      .connect(notchNode)
+      .connect(eqNode)
       .connect(presenceNode)
       .connect(compressorNode)
       .connect(gainNode)
@@ -158,6 +196,14 @@
     const now = audioCtx.currentTime;
     highpassNode.frequency.setTargetAtTime(p.low_cut_hz, now, 0.02);
     lowpassNode.frequency.setTargetAtTime(p.high_cut_hz, now, 0.02);
+    eqNode.frequency.setTargetAtTime(p.eq_freq, now, 0.02);
+    eqNode.gain.setTargetAtTime(p.eq_gain, now, 0.02);
+    if (p.notch_freq > 0) {
+      notchNode.frequency.setTargetAtTime(p.notch_freq, now, 0.02);
+      notchNode.gain.setTargetAtTime(p.notch_db, now, 0.02);
+    } else {
+      notchNode.gain.setTargetAtTime(0, now, 0.02); // off
+    }
     presenceNode.gain.setTargetAtTime((p.vocal_boost / 100) * 12, now, 0.02);
     compressorNode.threshold.setTargetAtTime(-24 - (p.compression / 100) * 20, now, 0.02);
     compressorNode.ratio.setTargetAtTime(1 + (p.compression / 100) * 11, now, 0.02);
