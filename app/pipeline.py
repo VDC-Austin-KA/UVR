@@ -65,11 +65,17 @@ class TweakParams:
     noise_reduction: float = 55.0   # ffmpeg denoise strength (on top of AI)
     low_cut_hz: float = 90.0        # highpass cutoff, Hz (20-300)
     high_cut_hz: float = 7500.0     # lowpass cutoff, Hz (2000-8000)
+    eq_freq: float = 2500.0         # voice-band EQ center, Hz (300-6000)
+    eq_gain: float = 0.0            # voice-band EQ boost/cut, dB (-15..15); 0 = off
+    notch_freq: float = 0.0         # tonal-noise notch center, Hz (0 = off, else 50-3000)
+    notch_db: float = -18.0         # notch depth, dB (-40..0)
     vocal_boost: float = 100.0      # speechnorm/compressor makeup intensity
     compression: float = 42.0       # acompressor ratio intensity
     gain_db: float = 0.0            # extra loudness target shift, dB (-12..12)
     gate_threshold: float = -60.0   # noise gate threshold, dB (-70..-20); -70 ~= off
     use_ai_denoise: bool = True     # run DeepFilterNet3 if available
+    df_postfilter: bool = False     # DeepFilterNet post-filter (--pf), stronger suppression
+    df_strength: float = 100.0      # DeepFilterNet max attenuation, dB (0-100); 100 = default/full
     use_transcription: bool = True  # run whisper.cpp if available
 
     @classmethod
@@ -84,15 +90,23 @@ class TweakParams:
         return cls(**clean)
 
     def clamped(self) -> "TweakParams":
+        # notch_freq of 0 means "off"; otherwise keep it in a sane range.
+        notch_freq = self.notch_freq if self.notch_freq <= 0 else _clamp(self.notch_freq, 50, 3000)
         return TweakParams(
             noise_reduction=_clamp(self.noise_reduction, 0, 100),
             low_cut_hz=_clamp(self.low_cut_hz, 20, 300),
             high_cut_hz=_clamp(self.high_cut_hz, 2000, 8000),
+            eq_freq=_clamp(self.eq_freq, 300, 6000),
+            eq_gain=_clamp(self.eq_gain, -15, 15),
+            notch_freq=notch_freq,
+            notch_db=_clamp(self.notch_db, -40, 0),
             vocal_boost=_clamp(self.vocal_boost, 0, 100),
             compression=_clamp(self.compression, 0, 100),
             gain_db=_clamp(self.gain_db, -12, 12),
             gate_threshold=_clamp(self.gate_threshold, -70, -20),
             use_ai_denoise=self.use_ai_denoise,
+            df_postfilter=self.df_postfilter,
+            df_strength=_clamp(self.df_strength, 0, 100),
             use_transcription=self.use_transcription,
         )
 
@@ -158,18 +172,31 @@ def _ffmpeg_af(in_wav: Path, out_wav: Path, chain: str, sample_fmt: str = "pcm_s
 
 
 def _denoise_chain(params: TweakParams) -> str:
-    """Build the ffmpeg denoise segment. noise_reduction (0-100) maps to
-    afftdn's noise floor (-20 dB light .. -65 dB aggressive, within ffmpeg's
-    documented -80..-20 range) and anlmdn's strength."""
+    """Build the ffmpeg denoise/shaping segment.
+
+    - highpass/lowpass: band-limit to the voice range.
+    - notch (optional): a narrow deep cut at notch_freq to kill a steady tonal
+      noise (engine whine, hum) -- only added when notch_freq > 0.
+    - afftdn/anlmdn: broadband denoise; strength from noise_reduction.
+    - voice EQ (optional): a peaking boost/cut at eq_freq to lift the band the
+      voices sit in -- only added when eq_gain != 0.
+    """
     nr = params.noise_reduction / 100.0
     nf = -20 - nr * 45          # 0 -> -20dB, 100 -> -65dB
     anlmdn_s = 0.0001 + nr * 0.0019   # 0 -> 0.0001, 100 -> 0.002
-    return (
-        f"highpass=f={params.low_cut_hz:.0f},"
-        f"lowpass=f={params.high_cut_hz:.0f},"
-        f"afftdn=nf={nf:.1f}:nt=w:tn=1,"
-        f"anlmdn=s={anlmdn_s:.5f}:p=0.002:m=15"
-    )
+
+    parts = [
+        f"highpass=f={params.low_cut_hz:.0f}",
+        f"lowpass=f={params.high_cut_hz:.0f}",
+    ]
+    if params.notch_freq and params.notch_freq > 0 and params.notch_db < 0:
+        # narrow peaking cut = surgical notch with tunable depth
+        parts.append(f"equalizer=f={params.notch_freq:.0f}:t=q:w=8:g={params.notch_db:.1f}")
+    parts.append(f"afftdn=nf={nf:.1f}:nt=w:tn=1")
+    parts.append(f"anlmdn=s={anlmdn_s:.5f}:p=0.002:m=15")
+    if abs(params.eq_gain) > 0.01:
+        parts.append(f"equalizer=f={params.eq_freq:.0f}:t=q:w=1.4:g={params.eq_gain:.1f}")
+    return ",".join(parts)
 
 
 def enhance_speech(in_wav: Path, work_dir: Path, params: TweakParams, progress_cb: ProgressCB = None) -> Path:
@@ -183,7 +210,23 @@ def enhance_speech(in_wav: Path, work_dir: Path, params: TweakParams, progress_c
         out_dir = work_dir / "dfn"
         out_dir.mkdir(parents=True, exist_ok=True)
         # deep-filter reads/writes 48kHz and writes <out_dir>/<input name>.
-        _run([config.DEEPFILTER_BIN, "-o", str(out_dir), str(in_wav)], timeout=1800)
+        base_cmd = [config.DEEPFILTER_BIN, "-o", str(out_dir)]
+        extra = []
+        if params.df_postfilter:
+            extra.append("--pf")
+        if params.df_strength < 100:
+            # cap how much attenuation the model may apply (gentler at lower values)
+            extra += ["--atten-lim", f"{params.df_strength:.0f}"]
+        try:
+            _run(base_cmd + extra + [str(in_wav)], timeout=1800)
+        except PipelineError:
+            # A bad/unsupported flag must never break the working AI denoise:
+            # fall back to the plain, known-good invocation.
+            if extra:
+                logger.warning("deep-filter extra flags %s failed; retrying without them", extra)
+                _run(base_cmd + [str(in_wav)], timeout=1800)
+            else:
+                raise
         enhanced = out_dir / in_wav.name
         if not enhanced.exists():
             cands = list(out_dir.glob("*.wav"))
